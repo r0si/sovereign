@@ -44,24 +44,32 @@ func operatorCtxFor(method, path string) (*gin.Context, *httptest.ResponseRecord
 	return c, w
 }
 
-// TestSQLiteOnlyMaintenanceRefusedOnPostgres proves backup and restore answer
-// 501 with actionable guidance on a non-SQLite driver instead of failing with a
-// cryptic SQL error (or "restoring" a file nothing reads). VACUUM is NOT in this
-// list: the maintenance endpoint was rewritten to run PostgreSQL's ANALYZE and
-// report pg_database_size, so refusing it on the only production driver would
-// make the button dead in every real deployment (it is covered by
-// TestDBVacuumRunsAnalyzeOnPostgres instead).
+// TestSQLiteOnlyMaintenanceRefusedOnPostgres proves PostgreSQL maintenance
+// reaches the PostgreSQL backup path and fails with actionable configuration
+// guidance instead of the retired SQLite-only 501 response.
 func TestSQLiteOnlyMaintenanceRefusedOnPostgres(t *testing.T) {
 	ginSetTestMode(t)
 	s := &Server{db: newFakePostgresDB(t), cfg: config.DefaultConfig()}
 
 	c, w := operatorCtxFor(http.MethodPost, "/settings/db/backup")
 	s.handleDBBackup(c)
-	assertNotImplemented(t, "backup", w)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("backup: status=%d, want 500; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "encrypted PostgreSQL backups unavailable") {
+		t.Fatalf("backup: body lacks PostgreSQL backup guidance: %s", w.Body.String())
+	}
 
 	c, w = operatorCtxFor(http.MethodPost, "/settings/db/restore")
+	c.Request = httptest.NewRequest(http.MethodPost, "/settings/db/restore", strings.NewReader("type=file"))
+	c.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	s.handleDBRestore(c)
-	assertNotImplemented(t, "restore", w)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("restore: status=%d, want 500; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "PostgreSQL restore unavailable") {
+		t.Fatalf("restore: body lacks PostgreSQL restore guidance: %s", w.Body.String())
+	}
 }
 
 // TestDBVacuumRunsAnalyzeOnPostgres pins the intended behavior: the maintenance
@@ -92,16 +100,6 @@ func TestDBVacuumRunsAnalyzeOnPostgres(t *testing.T) {
 	// size is advisory but must be reported as a field.
 	if !strings.Contains(w.Body.String(), "\"size\"") {
 		t.Fatalf("vacuum response missing size field: %s", w.Body.String())
-	}
-}
-
-func assertNotImplemented(t *testing.T, name string, w *httptest.ResponseRecorder) {
-	t.Helper()
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("%s: status=%d, want 501; body=%s", name, w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "SQLite only") {
-		t.Fatalf("%s: body lacks the SQLite-only explanation: %s", name, w.Body.String())
 	}
 }
 
