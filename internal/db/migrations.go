@@ -824,6 +824,29 @@ var schemaMigrations = []*gormigrate.Migration{
 			return nil
 		},
 	},
+	{
+		ID: "2026-11-28-generated-report-tenant",
+		Migrate: func(tx *gorm.DB) error {
+			if !tx.Migrator().HasTable("generated_reports") {
+				return nil
+			}
+			if !tx.Migrator().HasColumn("generated_reports", "tenant_id") {
+				execMigration(tx, "ALTER TABLE generated_reports ADD COLUMN tenant_id INTEGER DEFAULT 0", "add_generated_reports_tenant_id")
+			}
+			if err := tx.Exec("UPDATE generated_reports SET tenant_id = 0 WHERE tenant_id IS NULL").Error; err != nil {
+				return err
+			}
+			execMigration(tx, "CREATE INDEX IF NOT EXISTS idx_generated_reports_tenant_created ON generated_reports(tenant_id, created_at)", "add_generated_reports_tenant_created")
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			execMigration(tx, "DROP INDEX IF EXISTS idx_generated_reports_tenant_created", "drop_generated_reports_tenant_created")
+			if tx.Migrator().HasColumn("generated_reports", "tenant_id") {
+				execMigration(tx, "ALTER TABLE generated_reports DROP COLUMN tenant_id", "drop_generated_reports_tenant_id")
+			}
+			return nil
+		},
+	},
 }
 
 // indexMigrations create/drop indexes and run AFTER AutoMigrate, so their

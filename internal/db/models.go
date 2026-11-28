@@ -1297,6 +1297,7 @@ func (SystemMetric) TableName() string { return "system_metrics" }
 
 type GeneratedReport struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
+	TenantID  uint      `gorm:"index" json:"tenant_id"`
 	Name      string    `gorm:"size:255" json:"name"`
 	Template  string    `gorm:"size:50" json:"template"`
 	Format    string    `gorm:"size:10;default:html" json:"format"`

@@ -121,7 +121,7 @@ func (s *Server) handleAutomationPage(c *gin.Context) {
 		rules = kept
 	}
 	var webhooks []db.WebhookConfig
-	if err := s.db.Limit(500).Find(&webhooks).Error; err != nil {
+	if err := s.tenantScope(s.db, c).Limit(500).Find(&webhooks).Error; err != nil {
 		slog.Error("Failed to list webhooks for automation page", "err", err)
 	}
 	s.renderPageOrJSON(c, gin.H{

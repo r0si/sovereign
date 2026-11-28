@@ -21,9 +21,13 @@ const bloodHoundDir = "data/bloodhound"
 
 // handleBloodHoundList returns all collected BloodHound results.
 func (s *Server) handleBloodHoundList(c *gin.Context) {
+	sub, ok := s.visibleAgentIDSubquery(c)
+	if !ok {
+		respond(c, gin.H{"results": []db.BloodHoundResult{}, "total": 0})
+		return
+	}
 	var results []db.BloodHoundResult
-	if err := s.db.Order("created_at desc").Limit(BloodHoundResultLimit).Find(&results).Error; err != nil {
-		// An empty 200 here reads as "nothing collected yet".
+	if err := s.db.Where("agent_id IN (?)", sub).Order("created_at desc").Limit(BloodHoundResultLimit).Find(&results).Error; err != nil {
 		handleQueryError(c, err, "Failed to list bloodhound results")
 		return
 	}
@@ -32,18 +36,19 @@ func (s *Server) handleBloodHoundList(c *gin.Context) {
 
 // handleBloodHoundStatus returns a summary of BloodHound collection state.
 func (s *Server) handleBloodHoundStatus(c *gin.Context) {
+	sub, ok := s.visibleAgentIDSubquery(c)
+	if !ok {
+		respond(c, gin.H{"total_collections": 0, "last_collection": time.Time{}, "last_agent_id": ""})
+		return
+	}
 	var total int64
-	if err := s.db.Model(&db.BloodHoundResult{}).Count(&total).Error; err != nil {
-		// A zero count here reads as "no collections ever": a failed
-		// count must not impersonate a clean bill of health.
+	if err := s.db.Model(&db.BloodHoundResult{}).Where("agent_id IN (?)", sub).Count(&total).Error; err != nil {
 		handleQueryError(c, err, "Failed to count bloodhound results")
 		return
 	}
 
 	var last db.BloodHoundResult
-	if err := s.db.Order("created_at desc").First(&last).Error; err != nil {
-		// Not-found is the legitimate "no collections yet" state; only a
-		// real failure is an error.
+	if err := s.db.Where("agent_id IN (?)", sub).Order("created_at desc").First(&last).Error; err != nil {
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			handleQueryError(c, err, "Failed to fetch last bloodhound result")
 			return
@@ -86,8 +91,13 @@ func (s *Server) handleBloodHoundCollect(c *gin.Context) {
 // handleBloodHoundDownload serves the collected ZIP for a result.
 func (s *Server) handleBloodHoundDownload(c *gin.Context) {
 	id := c.Param("id")
+	sub, ok := s.visibleAgentIDSubquery(c)
+	if !ok {
+		respondError(c, http.StatusNotFound, "not found")
+		return
+	}
 	var result db.BloodHoundResult
-	if err := s.db.First(&result, id).Error; err != nil {
+	if err := s.db.Where("id = ? AND agent_id IN (?)", id, sub).First(&result).Error; err != nil {
 		respondError(c, http.StatusNotFound, "not found")
 		return
 	}
@@ -106,8 +116,13 @@ func (s *Server) handleBloodHoundDownload(c *gin.Context) {
 // handleBloodHoundDelete removes a collection result and its file.
 func (s *Server) handleBloodHoundDelete(c *gin.Context) {
 	id := c.Param("id")
+	sub, ok := s.visibleAgentIDSubquery(c)
+	if !ok {
+		respondError(c, http.StatusNotFound, "not found")
+		return
+	}
 	var result db.BloodHoundResult
-	if err := s.db.First(&result, id).Error; err != nil {
+	if err := s.db.Where("id = ? AND agent_id IN (?)", id, sub).First(&result).Error; err != nil {
 		respondError(c, http.StatusNotFound, "not found")
 		return
 	}
@@ -118,8 +133,13 @@ func (s *Server) handleBloodHoundDelete(c *gin.Context) {
 			}
 		}
 	}
-	if err := s.db.Delete(&result).Error; err != nil {
+	deleted := s.db.Where("id = ? AND agent_id IN (?)", id, sub).Delete(&db.BloodHoundResult{})
+	if deleted.Error != nil {
 		respondError(c, http.StatusInternalServerError, "failed to delete bloodhound result")
+		return
+	}
+	if deleted.RowsAffected == 0 {
+		respondError(c, http.StatusNotFound, "not found")
 		return
 	}
 	respond(c, gin.H{})
@@ -128,6 +148,9 @@ func (s *Server) handleBloodHoundDelete(c *gin.Context) {
 // handleBloodHoundUpload accepts a manually uploaded SharpHound ZIP.
 func (s *Server) handleBloodHoundUpload(c *gin.Context) {
 	agentID := c.PostForm("agent_id")
+	if _, ok := s.getAgentOrFail(c, agentID); !ok {
+		return
+	}
 	data, _, ok := readFileUpload(c, "file")
 	if !ok {
 		return
@@ -164,6 +187,9 @@ func (s *Server) handleBloodHoundResult(c *gin.Context) {
 	agentID := c.PostForm("agent_id")
 	taskID := c.PostForm("task_id")
 	method := c.PostForm("collection_method")
+	if _, ok := s.getAgentOrFail(c, agentID); !ok {
+		return
+	}
 
 	if err := os.MkdirAll(bloodHoundDir, 0o755); err != nil {
 		respondError(c, http.StatusInternalServerError, sanitizeError(err, "File operation"))
@@ -207,17 +233,20 @@ func (s *Server) handleBloodHoundResult(c *gin.Context) {
 		return
 	}
 
-	// Mark the originating task completed.
+	// Mark only the matching SharpHound task for this visible agent complete.
 	if taskID != "" {
-		var task db.Task
-		if s.db.First(&task, taskID).Error == nil {
-			task.Status = "completed"
-			task.Result = "bloodhound collection stored"
-			if err := s.db.Save(&task).Error; err != nil {
-				slog.Error("Failed to update bloodhound task", "error", err)
+		live := []string{"pending", "running", "sent", TaskStatusPendingApproval}
+		updated := s.db.Model(&db.Task{}).
+			Where("id = ? AND agent_id = ? AND type = ? AND status IN ?", taskID, agentID, protocol.TaskTypeSharpHound, live).
+			Updates(map[string]interface{}{"status": "completed", "result": "bloodhound collection stored"})
+		if updated.Error != nil {
+			slog.Error("Failed to update bloodhound task", "error", updated.Error)
+		} else if updated.RowsAffected > 0 {
+			var task db.Task
+			if err := s.db.Where("id = ? AND agent_id = ? AND type = ?", taskID, agentID, protocol.TaskTypeSharpHound).First(&task).Error; err == nil {
+				s.broadcastTaskUpdate(task.AgentID, task)
+				s.decPendingTasks(task.AgentID)
 			}
-			s.broadcastTaskUpdate(task.AgentID, task)
-			s.decPendingTasks(task.AgentID)
 		}
 	}
 

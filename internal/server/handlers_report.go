@@ -699,7 +699,7 @@ func (s *Server) handleAPIGetReportFindings(c *gin.Context) {
 
 func (s *Server) handleAPIGetReportHistory(c *gin.Context) {
 	var reports []db.GeneratedReport
-	if err := s.db.Order("created_at desc").Limit(20).Find(&reports).Error; err != nil {
+	if err := s.tenantScope(s.db, c).Order("created_at desc").Limit(20).Find(&reports).Error; err != nil {
 		respondError(c, http.StatusInternalServerError, "report history query failed")
 		return
 	}
@@ -773,7 +773,7 @@ func (s *Server) handleAPIGetGeneratedReport(c *gin.Context) {
 		return
 	}
 	var r db.GeneratedReport
-	if err := s.db.First(&r, id).Error; err != nil {
+	if err := s.tenantScope(s.db, c).First(&r, id).Error; err != nil {
 		respondError(c, http.StatusNotFound, "report not found")
 		return
 	}
@@ -805,7 +805,7 @@ func (s *Server) handleAPIExportGeneratedReport(c *gin.Context) {
 		return
 	}
 	var r db.GeneratedReport
-	if err := s.db.First(&r, id).Error; err != nil {
+	if err := s.tenantScope(s.db, c).First(&r, id).Error; err != nil {
 		respondError(c, http.StatusNotFound, "report not found")
 		return
 	}
@@ -833,9 +833,14 @@ func (s *Server) handleAPIDeleteReport(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid report id")
 		return
 	}
-	if err := s.db.Delete(&db.GeneratedReport{}, id).Error; err != nil {
-		slog.Error("Failed to delete report", "id", id, "error", err)
+	result := s.tenantScope(s.db, c).Delete(&db.GeneratedReport{}, id)
+	if result.Error != nil {
+		slog.Error("Failed to delete report", "id", id, "error", result.Error)
 		respondError(c, http.StatusInternalServerError, "failed to delete report")
+		return
+	}
+	if result.RowsAffected == 0 {
+		respondError(c, http.StatusNotFound, "report not found")
 		return
 	}
 	respond(c, gin.H{})

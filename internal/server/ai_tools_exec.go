@@ -1103,7 +1103,12 @@ func (s *Server) executeToolSwitchCtx(reqCtx *aiReqCtx, name string, argsJSON st
 			title = fmt.Sprintf("AI %s Report %s", strings.ToUpper(p.Scope[:1])+p.Scope[1:], time.Now().Format("2006-01-02 15:04"))
 		}
 		sectionsJSON, _ := json.Marshal(sections)
+		tenantID := uint(0)
+		if reqCtx != nil {
+			tenantID = reqCtx.Principal.TenantID
+		}
 		rep := db.GeneratedReport{
+			TenantID: tenantID,
 			Name:     title,
 			Template: "ai_" + p.Scope,
 			Format:   "markdown",
