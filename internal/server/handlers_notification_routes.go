@@ -75,13 +75,21 @@ func (s *Server) DispatchNotification(n *db.Notification) {
 	if s == nil || s.db == nil || n == nil {
 		return
 	}
+	if n.AgentID != "" && n.TenantID == 0 {
+		tid, ok := s.agentTenantOf(n.AgentID)
+		if !ok {
+			slog.Error("Failed to resolve notification tenant", "agent_id", n.AgentID)
+			return
+		}
+		n.TenantID = tid
+	}
 	if err := s.db.Create(n).Error; err != nil {
 		slog.Error("Failed to persist notification", "title", n.Title, "error", err)
 		return
 	}
 
 	var routes []db.NotificationRoute
-	if err := s.db.Where("enabled = ?", true).Limit(50).Find(&routes).Error; err != nil {
+	if err := s.db.Where("enabled = ? AND tenant_id = ?", true, n.TenantID).Limit(50).Find(&routes).Error; err != nil {
 		slog.Error("Failed to load notification routes", "error", err)
 		return
 	}
@@ -154,7 +162,7 @@ func (s *Server) sendNotificationRoute(route db.NotificationRoute, n *db.Notific
 
 func (s *Server) handleListNotificationRoutes(c *gin.Context) {
 	var routes []db.NotificationRoute
-	if err := s.db.Order("id").Find(&routes).Error; err != nil {
+	if err := s.tenantScope(s.db, c).Order("id").Find(&routes).Error; err != nil {
 		respondError(c, http.StatusInternalServerError, "query failed")
 		return
 	}
@@ -329,6 +337,12 @@ func (s *Server) handleCreateNotificationRoute(c *gin.Context) {
 	}
 	req.ID = 0
 	req.Enabled = true
+	tid, ok := s.resolveTenant(c)
+	if !ok {
+		respondError(c, http.StatusForbidden, "tenant unavailable")
+		return
+	}
+	req.TenantID = tid
 	if req.MinSeverity == "" {
 		req.MinSeverity = "info"
 	}
@@ -347,7 +361,7 @@ func (s *Server) handleCreateNotificationRoute(c *gin.Context) {
 func (s *Server) handleUpdateNotificationRoute(c *gin.Context) {
 	id := c.Param("id")
 	var existing db.NotificationRoute
-	if err := s.db.First(&existing, id).Error; err != nil {
+	if err := s.tenantScope(s.db, c).First(&existing, id).Error; err != nil {
 		respondError(c, http.StatusNotFound, "route not found")
 		return
 	}
@@ -413,7 +427,7 @@ func (s *Server) handleUpdateNotificationRoute(c *gin.Context) {
 		respond(c, gin.H{})
 		return
 	}
-	if err := s.db.Model(&db.NotificationRoute{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+	if err := s.tenantScope(s.db.Model(&db.NotificationRoute{}), c).Where("id = ?", id).Updates(updates).Error; err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to update route")
 		return
 	}
@@ -423,7 +437,7 @@ func (s *Server) handleUpdateNotificationRoute(c *gin.Context) {
 
 func (s *Server) handleDeleteNotificationRoute(c *gin.Context) {
 	id := c.Param("id")
-	res := s.db.Delete(&db.NotificationRoute{}, id)
+	res := s.tenantScope(s.db, c).Delete(&db.NotificationRoute{}, id)
 	if res.Error != nil {
 		respondError(c, http.StatusInternalServerError, "failed to delete route")
 		return
@@ -441,7 +455,7 @@ func (s *Server) handleDeleteNotificationRoute(c *gin.Context) {
 func (s *Server) handleTestNotificationRoute(c *gin.Context) {
 	id := c.Param("id")
 	var route db.NotificationRoute
-	if err := s.db.First(&route, id).Error; err != nil {
+	if err := s.tenantScope(s.db, c).First(&route, id).Error; err != nil {
 		respondError(c, http.StatusNotFound, "route not found")
 		return
 	}

@@ -259,3 +259,39 @@ func TestEnforceSessionCapKeepsNewest(t *testing.T) {
 		t.Fatalf("cap 0 evicted %d", evicted)
 	}
 }
+
+func TestTenantAdminCannotAdministerForeignSessions(t *testing.T) {
+	s := mustTenantServer(t)
+	admin := seedSessionUser(t, s, "tenant-admin", db.RoleAdmin, 1)
+	foreign := seedSessionUser(t, s, "foreign-user", db.RoleUser, 2)
+	foreignSession := seedSession(t, s, foreign.ID, "foreign-session-token")
+
+	ctx := func(params gin.Params) (*gin.Context, *httptest.ResponseRecorder) {
+		c, w := sessionCtx(http.MethodPost, params, admin.ID, db.RoleAdmin)
+		c.Set("user", admin.Username)
+		c.Set(middleware.TenantIDContextKey, uint(1))
+		return c, w
+	}
+	c, w := ctx(gin.Params{{Key: "id", Value: jsonNumber(foreign.ID)}})
+	s.handleListUserSessions(c)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("foreign session list = %d, want 404", w.Code)
+	}
+	c, w = ctx(gin.Params{{Key: "id", Value: jsonNumber(foreign.ID)}, {Key: "sessionId", Value: jsonNumber(foreignSession.ID)}})
+	s.handleRevokeSession(c)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("foreign session revoke = %d, want 404", w.Code)
+	}
+	c, w = ctx(gin.Params{{Key: "id", Value: jsonNumber(foreign.ID)}})
+	s.handleRevokeAllUserSessions(c)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("foreign revoke-all = %d, want 404", w.Code)
+	}
+	revoked, err := s.isSessionRevoked("foreign-session-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoked {
+		t.Fatal("foreign session was revoked")
+	}
+}

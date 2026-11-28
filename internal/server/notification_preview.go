@@ -52,7 +52,7 @@ func (s *Server) handlePreviewNotification(c *gin.Context) {
 	}
 
 	var routes []db.NotificationRoute
-	if err := s.db.WithContext(s.ctx).Order("name asc").Limit(notificationPreviewMaxRoutes).Find(&routes).Error; err != nil {
+	if err := s.tenantScope(s.db.WithContext(s.ctx), c).Order("name asc").Limit(notificationPreviewMaxRoutes).Find(&routes).Error; err != nil {
 		handleQueryError(c, err, "Failed to load notification routes")
 		return
 	}

@@ -349,7 +349,7 @@ func (m *MonitorCollector) triggerAlert(rule *db.AlertRule, source, sourceName, 
 	// Fan the alert out as a notification too (persisted + routed to any
 	// configured Discord/Telegram/webhook channels).
 	m.server.DispatchNotification(&db.Notification{
-		Type:     rule.Type,
+		TenantID: alert.TenantID,
 		Title:    rule.Name,
 		Message:  alert.Message,
 		AgentID:  source,
@@ -357,7 +357,7 @@ func (m *MonitorCollector) triggerAlert(rule *db.AlertRule, source, sourceName, 
 	})
 
 	m.server.triggerWebhooks(Event{
-		Type:      EventType("alert." + rule.Type),
+		TenantID:  alert.TenantID,
 		AgentID:   source,
 		AgentHost: sourceName,
 		Timestamp: time.Now(),
@@ -757,15 +757,15 @@ func (s *Server) TriggerAlertForEvent(evt Event) {
 	var rules []db.AlertRule
 	switch evt.Type {
 	case EventCredentialFound:
-		if err := s.db.Where("enabled = ? AND type = ?", true, "credential_found").Limit(200).Find(&rules).Error; err != nil {
+		if err := s.db.Where("enabled = ? AND type = ? AND tenant_id = ?", true, "credential_found", evt.TenantID).Limit(200).Find(&rules).Error; err != nil {
 			slog.Error("Monitor: failed to query credential_found rules", "err", err)
 		}
 	case EventImplantCheckin:
-		if err := s.db.Where("enabled = ? AND type = ?", true, "agent_online").Limit(200).Find(&rules).Error; err != nil {
+		if err := s.db.Where("enabled = ? AND type = ? AND tenant_id = ?", true, "agent_online", evt.TenantID).Limit(200).Find(&rules).Error; err != nil {
 			slog.Error("Monitor: failed to query agent_online rules", "err", err)
 		}
 	case EventImplantDisconnect:
-		if err := s.db.Where("enabled = ? AND type = ?", true, "agent_offline").Limit(200).Find(&rules).Error; err != nil {
+		if err := s.db.Where("enabled = ? AND type = ? AND tenant_id = ?", true, "agent_offline", evt.TenantID).Limit(200).Find(&rules).Error; err != nil {
 			slog.Error("Monitor: failed to query agent_offline rules", "err", err)
 		}
 	}
@@ -1197,16 +1197,18 @@ func (s *Server) handleAgentRemoteInput(c *gin.Context) {
 	// write path at line speed. pushback is reported as 429, not silently
 	// dropped, so a mis-throttled client can tell.
 	if userID, ok := currentUserID(c); ok {
-		if holder, granted := s.claimControl(id, userID, c.GetString("user"), false); !granted {
-			// Exclusive control: another operator is driving this beacon. The
-			// refusal names the holder so the operator can ask them to stop or
-			// take over explicitly (POST /agents/:id/control action=take).
-			respondError(c, http.StatusConflict, controlConflictMessage(holder))
-			return
-		}
 		if !s.allowRemoteInput(strconv.FormatUint(uint64(userID), 10), id, req.Type) {
 			respondError(c, http.StatusTooManyRequests, "remote input rate limit exceeded")
 			return
+		}
+		if req.Type != "input_release" {
+			if holder, granted := s.claimControl(id, userID, c.GetString("user"), false); !granted {
+				// Exclusive control: another operator is driving this beacon. The
+				// refusal names the holder so the operator can ask them to stop or
+				// take over explicitly (POST /agents/:id/control action=take).
+				respondError(c, http.StatusConflict, controlConflictMessage(holder))
+				return
+			}
 		}
 	}
 

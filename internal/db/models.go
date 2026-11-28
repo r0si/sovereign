@@ -1163,6 +1163,7 @@ func (MacroRun) TableName() string { return "macro_runs" }
 // channel (Discord, Telegram, or a generic webhook).
 type NotificationRoute struct {
 	ID          uint      `gorm:"primaryKey" json:"id"`
+	TenantID    uint      `gorm:"index" json:"tenant_id"`
 	Name        string    `gorm:"size:128" json:"name"`
 	Channel     string    `gorm:"size:32" json:"channel"`                     // discord, telegram, webhook
 	Target      string    `gorm:"size:512" json:"target"`                     // discord/generic: webhook URL; telegram: chat id
@@ -1627,6 +1628,7 @@ type AutoTagRule struct {
 
 type Notification struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
+	TenantID  uint      `gorm:"index" json:"tenant_id"`
 	Type      string    `gorm:"size:50;not null;index" json:"type"`
 	Title     string    `gorm:"size:255" json:"title"`
 	Message   string    `gorm:"type:text" json:"message"`

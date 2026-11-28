@@ -847,6 +847,33 @@ var schemaMigrations = []*gormigrate.Migration{
 			return nil
 		},
 	},
+	{
+		ID: "2026-11-28-notification-tenant-scope",
+		Migrate: func(tx *gorm.DB) error {
+			for _, table := range []string{"notifications", "notification_routes"} {
+				if !tx.Migrator().HasTable(table) {
+					continue
+				}
+				if !tx.Migrator().HasColumn(table, "tenant_id") {
+					execMigration(tx, "ALTER TABLE "+table+" ADD COLUMN tenant_id INTEGER DEFAULT 0", "add_"+table+"_tenant_id")
+				}
+				if err := tx.Exec("UPDATE " + table + " SET tenant_id = 0 WHERE tenant_id IS NULL").Error; err != nil {
+					return err
+				}
+				execMigration(tx, "CREATE INDEX IF NOT EXISTS idx_"+table+"_tenant_id ON "+table+"(tenant_id)", "add_"+table+"_tenant_id_index")
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			for _, table := range []string{"notifications", "notification_routes"} {
+				execMigration(tx, "DROP INDEX IF EXISTS idx_"+table+"_tenant_id", "drop_"+table+"_tenant_id_index")
+				if tx.Migrator().HasColumn(table, "tenant_id") {
+					execMigration(tx, "ALTER TABLE "+table+" DROP COLUMN tenant_id", "drop_"+table+"_tenant_id")
+				}
+			}
+			return nil
+		},
+	},
 }
 
 // indexMigrations create/drop indexes and run AFTER AutoMigrate, so their

@@ -106,30 +106,40 @@ func (s *Server) isSessionRevoked(token string) (bool, error) {
 	return count > 0, nil
 }
 
-func (s *Server) handleListUserSessions(c *gin.Context) {
-	userID := c.Param("id")
-	// Never MustGet + bare assert here: a missing key panics the handler
-	// goroutine (masked as a 500 storm by gin.Recovery).
-	var requesterID uint
-	if v, ok := c.Get("user_id"); ok {
-		requesterID, _ = v.(uint)
+func (s *Server) resolveSessionTarget(c *gin.Context, userID string) (uint, bool) {
+	targetID, err := strconv.ParseUint(userID, 10, 64)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid user ID")
+		return 0, false
 	}
-	requesterRole := c.GetString("user_role")
-	if requesterRole != "admin" {
-		targetID, err := strconv.ParseUint(userID, 10, 64)
-		if err != nil {
-			respondError(c, http.StatusBadRequest, "Invalid user ID")
-			return
+	if c.GetString("user_role") == db.RoleAdmin {
+		if middleware.IsScopedAPIKey(c) {
+			respondError(c, http.StatusForbidden, "scoped API key denied")
+			return 0, false
 		}
-		if requesterID != uint(targetID) {
-			respondError(c, http.StatusForbidden, "Permission denied")
-			return
+		var target db.User
+		if !s.findTenantOrFail(c, &target, userID, "user") {
+			return 0, false
 		}
+		return uint(targetID), true
+	}
+	requesterID, ok := currentUserID(c)
+	if !ok || requesterID != uint(targetID) {
+		respondError(c, http.StatusForbidden, "Permission denied")
+		return 0, false
+	}
+	return uint(targetID), true
+}
+
+func (s *Server) handleListUserSessions(c *gin.Context) {
+	targetID, ok := s.resolveSessionTarget(c, c.Param("id"))
+	if !ok {
+		return
 	}
 	var sessions []db.UserSession
-	if err := s.db.Where("user_id = ? AND revoked_at = ? AND expires_at > ?", userID, time.Time{}, time.Now()).
+	if err := s.db.Where("user_id = ? AND revoked_at = ? AND expires_at > ?", targetID, time.Time{}, time.Now()).
 		Order("created_at DESC").Find(&sessions).Error; err != nil {
-		slog.Error("Failed to list user sessions", "err", err)
+		slog.Error("Failed to list user sessions", "error", err)
 		respondError(c, http.StatusInternalServerError, "Failed to list sessions")
 		return
 	}
@@ -139,30 +149,25 @@ func (s *Server) handleListUserSessions(c *gin.Context) {
 func (s *Server) handleRevokeSession(c *gin.Context) {
 	userID := c.Param("id")
 	sessionID := c.Param("sessionId")
-	var requesterID uint
-	if v, ok := c.Get("user_id"); ok {
-		requesterID, _ = v.(uint)
+	targetID, ok := s.resolveSessionTarget(c, userID)
+	if !ok {
+		return
 	}
-	requesterRole := c.GetString("user_role")
 
 	var session db.UserSession
 	if err := s.db.First(&session, "id = ?", sessionID).Error; err != nil {
 		respondError(c, http.StatusNotFound, "Session not found")
 		return
 	}
-
-	if requesterRole != "admin" {
-		targetID, err := strconv.ParseUint(userID, 10, 64)
-		if err != nil {
-			respondError(c, http.StatusBadRequest, "Invalid user ID")
-			return
-		}
-		if requesterID != uint(targetID) || session.UserID != uint(targetID) {
+	if session.UserID != targetID {
+		if c.GetString("user_role") == db.RoleAdmin {
+			respondError(c, http.StatusNotFound, "Session not found")
+		} else {
 			respondError(c, http.StatusForbidden, "Permission denied")
-			return
 		}
+		return
 	}
-	if err := s.db.Model(&db.UserSession{}).Where("id = ?", sessionID).
+	if err := s.db.Model(&db.UserSession{}).Where("id = ? AND user_id = ?", sessionID, targetID).
 		Update("revoked_at", time.Now()).Error; err != nil {
 		s.LogAuditRecord(c, "session_revoke", "user", userID,
 			fmt.Sprintf("Failed to revoke session %s for user %s", sessionID, userID), false, err)
@@ -176,13 +181,16 @@ func (s *Server) handleRevokeSession(c *gin.Context) {
 
 func (s *Server) handleRevokeAllUserSessions(c *gin.Context) {
 	userID := c.Param("id")
-	requesterRole := c.GetString("user_role")
-	if requesterRole != "admin" {
+	if c.GetString("user_role") != db.RoleAdmin {
 		respondError(c, http.StatusForbidden, "Permission denied")
 		return
 	}
+	targetID, ok := s.resolveSessionTarget(c, userID)
+	if !ok {
+		return
+	}
 	result := s.db.Model(&db.UserSession{}).
-		Where("user_id = ? AND revoked_at = ?", userID, time.Time{}).
+		Where("user_id = ? AND revoked_at = ?", targetID, time.Time{}).
 		Update("revoked_at", time.Now())
 	if err := result.Error; err != nil {
 		s.LogAuditRecord(c, "session_revoke_all", "user", userID,
@@ -193,7 +201,6 @@ func (s *Server) handleRevokeAllUserSessions(c *gin.Context) {
 	s.LogAuditRecord(c, "session_revoke_all", "user", userID,
 		fmt.Sprintf("Revoked %d session(s) for user %s", result.RowsAffected, userID), true, nil)
 	respond(c, gin.H{
-
 		"message": fmt.Sprintf("Revoked %d sessions", result.RowsAffected),
 	})
 }

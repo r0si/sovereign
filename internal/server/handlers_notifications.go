@@ -15,7 +15,7 @@ func (s *Server) handleListNotifications(c *gin.Context) {
 	severity := c.Query("severity")
 	read := c.Query("read")
 
-	q := s.db.Model(&db.Notification{})
+	q := s.tenantScope(s.db.Model(&db.Notification{}), c)
 	if typ != "" {
 		q = q.Where("type = ?", typ)
 	}
@@ -49,7 +49,7 @@ func (s *Server) handleListNotifications(c *gin.Context) {
 // PUT /notifications/:id/read
 func (s *Server) handleMarkNotificationRead(c *gin.Context) {
 	id := c.Param("id")
-	res := s.db.Model(&db.Notification{}).Where("id = ?", id).Update("read", true)
+	res := s.tenantScope(s.db.Model(&db.Notification{}), c).Where("id = ?", id).Update("read", true)
 	if res.Error != nil {
 		respondError(c, http.StatusInternalServerError, sanitizeError(res.Error, "Notification operation"))
 		return
@@ -64,7 +64,7 @@ func (s *Server) handleMarkNotificationRead(c *gin.Context) {
 // handleMarkAllNotificationsRead marks all unread notifications as read.
 // PUT /notifications/read-all
 func (s *Server) handleMarkAllNotificationsRead(c *gin.Context) {
-	if err := s.db.Model(&db.Notification{}).Where("read = ?", false).Update("read", true).Error; err != nil {
+	if err := s.tenantScope(s.db.Model(&db.Notification{}), c).Where("read = ?", false).Update("read", true).Error; err != nil {
 		respondError(c, http.StatusInternalServerError, sanitizeError(err, "Notification operation"))
 		return
 	}
@@ -75,7 +75,7 @@ func (s *Server) handleMarkAllNotificationsRead(c *gin.Context) {
 // DELETE /notifications/:id
 func (s *Server) handleDeleteNotification(c *gin.Context) {
 	id := c.Param("id")
-	res := s.db.Delete(&db.Notification{}, "id = ?", id)
+	res := s.tenantScope(s.db, c).Delete(&db.Notification{}, "id = ?", id)
 	if res.Error != nil {
 		respondError(c, http.StatusInternalServerError, sanitizeError(res.Error, "Notification operation"))
 		return
@@ -93,7 +93,7 @@ func (s *Server) handleClearAllNotifications(c *gin.Context) {
 	if !s.requireAdmin(c) {
 		return
 	}
-	if err := s.db.Where("1 = 1").Delete(&db.Notification{}).Error; err != nil {
+	if err := s.tenantScope(s.db, c).Where("1 = 1").Delete(&db.Notification{}).Error; err != nil {
 		respondError(c, http.StatusInternalServerError, sanitizeError(err, "Notification operation"))
 		return
 	}
