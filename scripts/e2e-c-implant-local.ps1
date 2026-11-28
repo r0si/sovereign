@@ -30,6 +30,7 @@ param(
     [string]$User = 'admin',
     [string]$Password,
     [string]$BeaconKey,
+    [string]$Dsn = 'postgres://sovereign:sovereign@127.0.0.1:5432/sovereign?sslmode=disable',
     [switch]$KeepWork
 )
 
@@ -105,7 +106,7 @@ try {
     # No end-of-line anchor: the example carries a trailing comment on the
     # data_dir line, and the trailing text must survive the rewrite.
     $cfg = $cfg -replace '(?m)^([ \t]*)data_dir: data\b', "`${1}data_dir: $WorkDir/data"
-    $cfg = $cfg -replace '(?m)^(\s*)path: data/db/sovereign.db', "`${1}path: $WorkDir/data/db/sovereign.db"
+    $cfg = $cfg -replace '(?m)^(\s*)dsn: .*$', "`${1}dsn: `"$Dsn`""
     $cfg = $cfg -replace '(?m)^(\s*)beacon_key: ""', "`${1}beacon_key: `"$BeaconKey`""
     $cfg = $cfg -replace '(?m)^(\s*)default_password: ""', "`${1}default_password: `"$Password`""
     # The two-man rule is a server-side gate with its own tests; this script
@@ -116,7 +117,7 @@ try {
     if ($cfg -notmatch "port: $Port" -or $cfg -notmatch 'tls_enabled: false' -or
         $cfg -notmatch 'require_tls_for_auth: false' -or $cfg -notmatch 'require_approval: false' -or
         $cfg -notmatch [regex]::Escape("data_dir: $WorkDir/data") -or
-        $cfg -notmatch [regex]::Escape("path: $WorkDir/data/db/sovereign.db") -or
+        $cfg -notmatch [regex]::Escape("dsn: `"$Dsn`"") -or
         $cfg -notmatch [regex]::Escape($Password) -or $cfg -notmatch [regex]::Escape($BeaconKey)) {
         throw 'config rewrite did not apply cleanly - is config.example.yaml unchanged?'
     }
@@ -148,7 +149,7 @@ try {
     if ($code -ne '302' -and $code -ne '200') {
         throw "login failed with HTTP ${code}: $(Get-Content "$WorkDir/login-body.txt" -Raw)"
     }
-    $mint = & go run ./cmd/mint-reg-secret -db "$WorkDir/data/db/sovereign.db" -beacon-key $BeaconKey
+    $mint = & go run ./cmd/mint-reg-secret -dsn $Dsn -beacon-key $BeaconKey
     if ($LASTEXITCODE -ne 0) { throw 'cmd/mint-reg-secret failed' }
     $sid = (($mint | Where-Object { $_ -like 'set SECRET_ID=*' }) -replace '^set SECRET_ID=', '')
     $sb64 = (($mint | Where-Object { $_ -like 'set SECRET_B64=*' }) -replace '^set SECRET_B64=', '')

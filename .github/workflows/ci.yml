@@ -819,6 +819,17 @@ jobs:
         shell: pwsh
         run: |
           docker run -d --name sovereign-pg -e POSTGRES_USER=sovereign -e POSTGRES_PASSWORD=sovereign -e POSTGRES_DB=sovereign -p 5432:5432 postgres:18-bookworm@sha256:e742a2668255221388004f3a42b6150a2103f5054ab3a4a93ae9e4f01e551c35
+          $ready = 0
+          for ($i = 0; $i -lt 90; $i++) {
+            docker exec sovereign-pg pg_isready -U sovereign -d sovereign | Out-Null
+            if ($LASTEXITCODE -eq 0) { $ready++ } else { $ready = 0 }
+            if ($ready -ge 2) { break }
+            Start-Sleep -Seconds 1
+          }
+          if ($ready -lt 2) {
+            docker logs sovereign-pg
+            throw 'PostgreSQL did not become ready'
+          }
       - name: Run C implant E2E
         shell: pwsh
         run: ./scripts/e2e-c-implant-local.ps1
