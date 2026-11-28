@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/r0si/sovereign/internal/config"
 	"github.com/r0si/sovereign/internal/db"
+	"github.com/r0si/sovereign/internal/server/middleware"
 )
 
 // ── AI Chat Page ──────────────────────────────────────────────────────────
@@ -468,6 +469,10 @@ func (s *Server) agentHostnamesByID(ids []string) map[string]string {
 }
 
 func (s *Server) handleAIPendingTasks(c *gin.Context) {
+	if !middleware.HasPermission(c, db.PermTasksRead) {
+		respondError(c, http.StatusForbidden, "tasks read permission required")
+		return
+	}
 	var tasks []db.Task
 	if err := s.tenantScope(s.db.Where("status = ? AND created_by = ?", "pending_approval", "ai"), c).Order("created_at desc").Limit(20).Find(&tasks).Error; err != nil {
 		respondError(c, http.StatusInternalServerError, "query failed")

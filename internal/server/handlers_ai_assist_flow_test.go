@@ -265,9 +265,10 @@ func TestHandleAINLQuery(t *testing.T) {
 	if err := s.db.Create(&db.Implant{ID: "nl-agent", TenantID: 1, Hostname: "nl-host", Status: "online"}).Error; err != nil {
 		t.Fatal(err)
 	}
-	s.db.Create(&db.Task{AgentID: "nl-agent", Type: "shell", Command: "net user", Status: "completed"})
-	s.db.Create(&db.Task{AgentID: "nl-agent", Type: "shell", Command: "whoami", Status: "failed"})
-	s.db.Create(&db.Task{AgentID: "nl-agent", Type: "screenshot", Status: "completed"})
+	s.db.Create(&db.Task{AgentID: "nl-agent", TenantID: 1, Type: "shell", Command: "net user", Status: "completed"})
+	s.db.Create(&db.Task{AgentID: "nl-agent", TenantID: 1, Type: "shell", Command: "whoami", Status: "failed"})
+	s.db.Create(&db.Task{AgentID: "nl-agent", TenantID: 1, Type: "screenshot", Status: "completed"})
+	s.db.Create(&db.Task{AgentID: "nl-agent", TenantID: 2, Type: "shell", Command: "other-tenant-secret", Status: "completed"})
 
 	filter := `{"keywords":["net user"],"agent_hostname":"nl-host","task_type":"shell","status":"completed","since_days":999}`
 	srv, last := fakeProvider(t, http.StatusOK,
@@ -304,6 +305,9 @@ func TestHandleAINLQuery(t *testing.T) {
 	}
 	if len(out.Tasks) != 1 || out.Tasks[0].Command != "net user" {
 		t.Fatalf("filtered tasks = %+v", out.Tasks)
+	}
+	if strings.Contains(w.Body.String(), "other-tenant-secret") {
+		t.Fatalf("another tenant's task leaked: %s", w.Body.String())
 	}
 
 	// A status outside the whitelist is dropped rather than passed to SQL.

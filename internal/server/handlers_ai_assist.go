@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/r0si/sovereign/internal/config"
 	"github.com/r0si/sovereign/internal/db"
+	"github.com/r0si/sovereign/internal/server/middleware"
 	"gorm.io/gorm"
 )
 
@@ -447,6 +448,10 @@ var nlQueryStatuses = map[string]bool{
 // The LLM never writes SQL - it only picks fields, so hallucinations cannot
 // reach the database layer.
 func (s *Server) handleAINLQuery(c *gin.Context) {
+	if !middleware.HasPermission(c, db.PermTasksRead) {
+		respondError(c, http.StatusForbidden, "tasks read permission required")
+		return
+	}
 	if !s.aiAssistReady() {
 		aiAssistUnavailable(c)
 		return
@@ -493,7 +498,7 @@ Rules: keywords = distinctive words likely inside command/result text ([] for no
 	}
 	filter.TaskType = strings.ToLower(strings.TrimSpace(filter.TaskType))
 
-	q := s.db.Model(&db.Task{}).Where("created_at >= ?", time.Now().AddDate(0, 0, -filter.SinceDays))
+	q := s.tenantScope(s.db.Model(&db.Task{}), c).Where("created_at >= ?", time.Now().AddDate(0, 0, -filter.SinceDays))
 	if filter.Status != "" {
 		q = q.Where("status = ?", filter.Status)
 	}
@@ -501,7 +506,7 @@ Rules: keywords = distinctive words likely inside command/result text ([] for no
 		q = q.Where("LOWER(type) LIKE ? ESCAPE '\\'", "%"+strings.ToLower(escapeLike(filter.TaskType))+"%")
 	}
 	if hn := strings.TrimSpace(filter.AgentHostname); hn != "" {
-		q = q.Where("agent_id IN (?)", s.db.Model(&db.Implant{}).
+		q = q.Where("agent_id IN (?)", s.tenantScope(s.db.Model(&db.Implant{}), c).
 			Select("id").Where("LOWER(hostname) LIKE ? ESCAPE '\\'", "%"+strings.ToLower(escapeLike(hn))+"%"))
 	}
 	kwCount := 0

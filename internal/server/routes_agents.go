@@ -42,15 +42,20 @@ func (s *Server) registerAgentRoutes(auth *gin.RouterGroup) {
 		agentsRead.GET("/agents/:id/config", s.handleGetAgentConfig)
 		agentsRead.GET("/agents/:id/chain", s.handleAgentChainGet)
 		agentsRead.GET("/agents/:id/status-history", s.handleAgentStatusHistory)
-		agentsRead.GET("/api/ai/pending-tasks", s.handleAIPendingTasks)
 		agentsRead.GET("/api/ai/status", s.handleAIStatus)
-		agentsRead.POST("/api/ai/analyze-result", s.handleAIAnalyzeResult)
-		agentsRead.POST("/api/ai/suggest-next-steps", s.handleAISuggestNextSteps)
-		agentsRead.POST("/api/ai/nl-query", s.handleAINLQuery)
-		agentsRead.POST("/api/ai/generate-playbook", s.handleAIGeneratePlaybook)
-		agentsRead.POST("/api/ai/run-review", s.handleAIRunReview)
 		agentsRead.GET("/api/handover/export", s.handleHandoverExport)
 		agentsRead.GET("/api/scheduler/oneshot", s.handleListOneShotTasks)
+	}
+
+	aiUse := auth.Group("/")
+	aiUse.Use(middleware.RequirePermission(db.PermAIUse))
+	{
+		aiUse.GET("/api/ai/pending-tasks", s.handleAIPendingTasks)
+		aiUse.POST("/api/ai/analyze-result", s.handleAIAnalyzeResult)
+		aiUse.POST("/api/ai/suggest-next-steps", s.handleAISuggestNextSteps)
+		aiUse.POST("/api/ai/nl-query", s.handleAINLQuery)
+		aiUse.POST("/api/ai/generate-playbook", s.handleAIGeneratePlaybook)
+		aiUse.POST("/api/ai/run-review", s.handleAIRunReview)
 	}
 
 	filesRead := auth.Group("/")
