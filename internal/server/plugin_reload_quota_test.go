@@ -70,6 +70,9 @@ func TestReloadAppliesPluginTrustPolicy(t *testing.T) {
 	if err := s.applyPluginTrust(); err == nil {
 		t.Fatal("an invalid trusted_keys list was accepted")
 	}
+	if !s.pluginManager.RequireSigned() {
+		t.Fatal("invalid trusted_keys left unsigned plugins enabled")
+	}
 }
 
 // TestApplyPluginTrustIsIdempotent keeps the startup path safe to call twice (it is

@@ -620,16 +620,16 @@ func (s *Server) handlePhishingLanding(c *gin.Context) {
 		return
 	}
 
-	// Rate limit per token+IP to blunt brute-force submissions and page
-	// hammering on this unauthenticated endpoint.
-	if !s.phishingLandingAllowed(token, c.ClientIP()) {
-		c.String(http.StatusTooManyRequests, "too many requests")
-		return
-	}
-
 	var evt db.PhishingEvent
 	if err := s.db.Where("token = ?", token).Order("id asc").First(&evt).Error; err != nil {
 		c.String(http.StatusNotFound, "not found")
+		return
+	}
+
+	// Only valid tokens consume limiter keys; random token probes cannot grow
+	// the unauthenticated limiter maps.
+	if !s.phishingLandingAllowed(token, c.ClientIP()) {
+		c.String(http.StatusTooManyRequests, "too many requests")
 		return
 	}
 
@@ -722,6 +722,7 @@ const (
 	phishingLandingWindow     = 10 * time.Minute
 	phishingOpenDedupWindow   = 24 * time.Hour
 	phishingLimiterMaxEntries = 100000
+	phishingLandingIPLimit    = 600
 )
 
 // phishingLandingAllowed enforces a sliding per token+IP request budget on the
@@ -740,7 +741,30 @@ func (s *Server) phishingLandingAllowed(token, ip string) bool {
 		s.landingLimiterHits = make(map[string]int)
 		s.landingLimiterSince = make(map[string]time.Time)
 	}
-
+	if s.landingIPHits == nil {
+		s.landingIPHits = make(map[string]int)
+		s.landingIPSince = make(map[string]time.Time)
+	}
+	if len(s.landingIPHits) >= phishingLimiterMaxEntries {
+		for key, since := range s.landingIPSince {
+			if now.Sub(since) >= phishingLandingWindow {
+				delete(s.landingIPHits, key)
+				delete(s.landingIPSince, key)
+			}
+		}
+	}
+	if len(s.landingIPHits) >= phishingLimiterMaxEntries {
+		return false
+	}
+	if hits, ok := s.landingIPHits[ip]; ok && now.Sub(s.landingIPSince[ip]) < phishingLandingWindow {
+		if hits >= phishingLandingIPLimit {
+			return false
+		}
+		s.landingIPHits[ip] = hits + 1
+	} else {
+		s.landingIPHits[ip] = 1
+		s.landingIPSince[ip] = now
+	}
 	if hits, ok := s.landingLimiterHits[key]; ok {
 		since := s.landingLimiterSince[key]
 		if now.Sub(since) < phishingLandingWindow {
@@ -761,6 +785,9 @@ func (s *Server) phishingLandingAllowed(token, ip string) bool {
 				delete(s.landingLimiterSince, k)
 			}
 		}
+	}
+	if len(s.landingLimiterHits) >= phishingLimiterMaxEntries {
+		return false
 	}
 
 	s.landingLimiterHits[key] = 1

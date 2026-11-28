@@ -810,6 +810,17 @@ func (c *Config) Validate() error {
 	if c.Server.Port <= 0 || c.Server.Port > 65535 {
 		errs = append(errs, errors.New("server.port must be between 1 and 65535"))
 	}
+	for _, proxy := range c.Server.TrustedProxies {
+		proxy = strings.TrimSpace(proxy)
+		if proxy == "" {
+			continue
+		}
+		if _, err := netip.ParsePrefix(proxy); err != nil {
+			if _, addrErr := netip.ParseAddr(proxy); addrErr != nil {
+				errs = append(errs, fmt.Errorf("server.trusted_proxies entry %q must be an IP or CIDR", proxy))
+			}
+		}
+	}
 	if c.WebRTC.Enabled {
 		if strings.TrimSpace(c.WebRTC.TurnAddr) == "" {
 			errs = append(errs, errors.New("webrtc.turn_addr is required when webrtc.enabled is true"))

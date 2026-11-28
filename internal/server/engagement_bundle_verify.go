@@ -28,6 +28,10 @@ import (
 // POST /api/engagements/:id/bundle/verify   (body: the zip, application/zip)
 
 const engagementBundleVerifyMaxBytes = 128 << 20
+const engagementBundleVerifyMaxMembers = 1024
+const engagementBundleVerifyMaxMemberBytes = 64 << 20
+const engagementBundleVerifyMaxTotalBytes = 256 << 20
+const engagementBundleVerifyMaxManifestBytes = 1 << 20
 
 // handleVerifyEngagementBundle re-computes the manifest digests of an uploaded bundle.
 func (s *Server) handleVerifyEngagementBundle(c *gin.Context) {
@@ -52,27 +56,66 @@ func (s *Server) handleVerifyEngagementBundle(c *gin.Context) {
 		return
 	}
 
-	contents := make(map[string][]byte, len(reader.File))
+	digests := make(map[string][sha256.Size]byte, len(reader.File))
+	sizes := make(map[string]int64, len(reader.File))
+	names := make(map[string]struct{}, len(reader.File))
+	var manifestRaw []byte
+	var declaredTotal, actualTotal int64
 	for _, file := range reader.File {
 		if file.FileInfo().IsDir() {
 			continue
 		}
+		if len(names) >= engagementBundleVerifyMaxMembers {
+			respondError(c, http.StatusRequestEntityTooLarge, "bundle has too many members")
+			return
+		}
+		if file.UncompressedSize64 > engagementBundleVerifyMaxMemberBytes {
+			respondError(c, http.StatusRequestEntityTooLarge, "bundle member exceeds 64 MiB")
+			return
+		}
+		declaredTotal += int64(file.UncompressedSize64)
+		if declaredTotal > engagementBundleVerifyMaxTotalBytes {
+			respondError(c, http.StatusRequestEntityTooLarge, "bundle expands beyond 256 MiB")
+			return
+		}
+		if _, duplicate := names[file.Name]; duplicate {
+			respondError(c, http.StatusBadRequest, "bundle contains duplicate member names")
+			return
+		}
+		names[file.Name] = struct{}{}
 		handle, err := file.Open()
 		if err != nil {
 			respondError(c, http.StatusBadRequest, "failed to open a member of the uploaded bundle")
 			return
 		}
-		content, err := io.ReadAll(handle)
+		if file.Name == "MANIFEST.json" {
+			content, readErr := io.ReadAll(io.LimitReader(handle, engagementBundleVerifyMaxManifestBytes+1))
+			_ = handle.Close()
+			if readErr != nil || len(content) > engagementBundleVerifyMaxManifestBytes {
+				respondError(c, http.StatusRequestEntityTooLarge, "MANIFEST.json exceeds 1 MiB")
+				return
+			}
+			manifestRaw = content
+			actualTotal += int64(len(content))
+			continue
+		}
+		hash := sha256.New()
+		n, copyErr := io.Copy(hash, io.LimitReader(handle, engagementBundleVerifyMaxMemberBytes+1))
 		_ = handle.Close()
-		if err != nil {
-			respondError(c, http.StatusBadRequest, "failed to read a member of the uploaded bundle")
+		if copyErr != nil || n > engagementBundleVerifyMaxMemberBytes {
+			respondError(c, http.StatusRequestEntityTooLarge, "bundle member exceeds 64 MiB")
 			return
 		}
-		contents[file.Name] = content
+		actualTotal += n
+		if actualTotal > engagementBundleVerifyMaxTotalBytes {
+			respondError(c, http.StatusRequestEntityTooLarge, "bundle expands beyond 256 MiB")
+			return
+		}
+		digests[file.Name] = [sha256.Size]byte(hash.Sum(nil))
+		sizes[file.Name] = n
 	}
 
-	manifestRaw, hasManifest := contents["MANIFEST.json"]
-	if !hasManifest {
+	if manifestRaw == nil {
 		respondError(c, http.StatusBadRequest, "the archive has no MANIFEST.json, so there is nothing to verify against")
 		return
 	}
@@ -107,23 +150,27 @@ func (s *Server) handleVerifyEngagementBundle(c *gin.Context) {
 	problems := make([]problem, 0, 4)
 	for _, entry := range manifest.Members {
 		checked++
-		content, present := contents[entry.Name]
-		if !present {
-			problems = append(problems, problem{entry.Name, "listed in the manifest but missing from the archive"})
-			continue
-		}
 		if entry.SHA256 == "" {
 			// MANIFEST.json is the legitimate case: it cannot contain its own digest.
 			unverifiable = append(unverifiable, problem{entry.Name, "no digest published"})
 			continue
 		}
-		sum := sha256.Sum256(content)
-		if got := hex.EncodeToString(sum[:]); got != entry.SHA256 {
-			problems = append(problems, problem{entry.Name, fmt.Sprintf("digest mismatch: archive %s, manifest %s", got[:16], entry.SHA256[:16])})
+		sum, present := digests[entry.Name]
+		if !present {
+			problems = append(problems, problem{entry.Name, "listed in the manifest but missing from the archive"})
 			continue
 		}
-		if entry.Bytes != 0 && entry.Bytes != len(content) {
-			problems = append(problems, problem{entry.Name, fmt.Sprintf("size mismatch: archive %d, manifest %d", len(content), entry.Bytes)})
+		got := hex.EncodeToString(sum[:])
+		if got != entry.SHA256 {
+			want := entry.SHA256
+			if len(want) > 16 {
+				want = want[:16]
+			}
+			problems = append(problems, problem{entry.Name, fmt.Sprintf("digest mismatch: archive %s, manifest %s", got[:16], want)})
+			continue
+		}
+		if entry.Bytes != 0 && int64(entry.Bytes) != sizes[entry.Name] {
+			problems = append(problems, problem{entry.Name, fmt.Sprintf("size mismatch: archive %d, manifest %d", sizes[entry.Name], entry.Bytes)})
 			continue
 		}
 		verified++
@@ -134,7 +181,7 @@ func (s *Server) handleVerifyEngagementBundle(c *gin.Context) {
 		listed[entry.Name] = true
 	}
 	extra := make([]string, 0, 2)
-	for name := range contents {
+	for name := range names {
 		if !listed[name] {
 			extra = append(extra, name)
 		}

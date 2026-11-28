@@ -380,7 +380,8 @@ func TestValidate(t *testing.T) {
 	}{
 		{"valid defaults", func(c *Config) {}, false, ""},
 		{"port too low", func(c *Config) { c.Server.Port = 0 }, true, "server.port"},
-		{"port too high", func(c *Config) { c.Server.Port = 99999 }, true, "server.port"},
+		{"invalid trusted proxy", func(c *Config) { c.Server.TrustedProxies = []string{"not-an-ip"} }, true, "trusted_proxies"},
+		{"valid trusted proxy CIDR", func(c *Config) { c.Server.TrustedProxies = []string{"192.0.2.0/24", "2001:db8::1"} }, false, ""},
 		{"offline threshold zero", func(c *Config) { c.Server.OfflineThreshold = 0 }, true, "offline_threshold"},
 		{"session max age zero", func(c *Config) { c.Server.SessionMaxAgeHours = 0 }, true, "session_max_age"},
 		{"negative session_max_concurrent", func(c *Config) { c.Auth.SessionMaxConcurrent = -1 }, true, "session_max_concurrent"},

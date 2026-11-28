@@ -213,12 +213,21 @@ func (s *Server) cleanupStaleMapEntries() {
 	// Clean expired phishing landing rate-limiter windows (keyed token+IP;
 	// attackers can mint unbounded keys, so anything past the window goes).
 	s.landingLimiterMu.Lock()
+	winCutoff := time.Now().Add(-phishingLandingWindow)
 	if s.landingLimiterSince != nil {
-		winCutoff := time.Now().Add(-phishingLandingWindow)
 		for k, since := range s.landingLimiterSince {
 			if since.Before(winCutoff) {
 				delete(s.landingLimiterHits, k)
 				delete(s.landingLimiterSince, k)
+				cleaned++
+			}
+		}
+	}
+	if s.landingIPSince != nil {
+		for key, since := range s.landingIPSince {
+			if since.Before(winCutoff) {
+				delete(s.landingIPHits, key)
+				delete(s.landingIPSince, key)
 				cleaned++
 			}
 		}

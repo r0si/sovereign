@@ -330,6 +330,8 @@ type Server struct {
 	landingLimiterMu    sync.Mutex
 	landingLimiterHits  map[string]int
 	landingLimiterSince map[string]time.Time
+	landingIPHits       map[string]int
+	landingIPSince      map[string]time.Time
 
 	// External C2 channels (WebSocket relay, Discord, Slack)
 	extC2Channels map[string]*extC2WSChannel
@@ -485,9 +487,12 @@ func New(cfg *config.Config, database *gorm.DB) *Server { // config-lock: constr
 	// can spoof the header to bypass login lockout, account lockout, and rate limits.
 	if len(cfg.Server.TrustedProxies) > 0 {
 		if err := r.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
-			slog.Error("Invalid trusted_proxies config, ignoring", "error", err, "proxies", cfg.Server.TrustedProxies)
+			slog.Error("Invalid trusted_proxies config; refusing forwarded client IPs", "error", err, "proxies", cfg.Server.TrustedProxies)
+			_ = r.SetTrustedProxies(nil)
+			middleware.SetTrustedProxyIPs(nil)
+		} else {
+			middleware.SetTrustedProxyIPs(cfg.Server.TrustedProxies)
 		}
-		middleware.SetTrustedProxyIPs(cfg.Server.TrustedProxies)
 	} else {
 		_ = r.SetTrustedProxies(nil) // nil never errors: only a CIDR list can fail validation
 		middleware.SetTrustedProxyIPs(nil)
@@ -529,6 +534,8 @@ func New(cfg *config.Config, database *gorm.DB) *Server { // config-lock: constr
 		seqLockout:            make(map[string]time.Time),
 		landingLimiterHits:    make(map[string]int),
 		landingLimiterSince:   make(map[string]time.Time),
+		landingIPHits:         make(map[string]int),
+		landingIPSince:        make(map[string]time.Time),
 		agentStatusCooldown:   make(map[string]time.Time),
 		ntlmRelays:            newNTLMRelayStore(),
 		backlogAgents:         make(map[string]struct{}),
@@ -787,7 +794,8 @@ func New(cfg *config.Config, database *gorm.DB) *Server { // config-lock: constr
 	// failure itself; this line matters for the hot-reload hook, which shares
 	// the same call and must not silently keep the old policy.
 	if err := s.applyPluginTrust(); err != nil {
-		slog.Warn("Failed to apply plugin trust policy; packages load unverified", "err", err)
+		slog.Error("Invalid plugin trust configuration; refusing startup", "err", err)
+		os.Exit(1)
 	}
 
 	pluginDir := filepath.Join(s.cfg.Server.DataDir, "plugins")
@@ -988,15 +996,10 @@ func (s *Server) SetupRoutes() { // config-lock: boot, before the listener serve
 	auth.Use(s.operatorPlaneGuard())
 	auth.Use(middleware.AuthRequired(s.db))
 	auth.Use(middleware.CSRFProtect())
-	// Transfer chunks are 2 MiB RAW; base64 inflates them to ~2.8 MiB. A
-	// blanket 2 MiB reader rejected the largest legal chunk before the handler
-	// could validate it, so only this one route gets the larger budget.
+	// JSON routes share a small default. Multipart uploads and the raw bundle
+	// verifier enforce their own larger limits inside the handler.
 	auth.Use(func(c *gin.Context) {
-		limit := int64(MaxJSONBodySize)
-		if c.Request.Method == http.MethodPut && strings.HasSuffix(c.Request.URL.Path, "/chunk") {
-			limit = TransferChunkJSONLimit
-		}
-		if c.Request.Body != nil {
+		if limit := authBodyLimit(c.Request.Method, c.Request.URL.Path, c.ContentType()); limit > 0 && c.Request.Body != nil {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 		}
 		c.Next()
@@ -1142,7 +1145,8 @@ func (s *Server) applyPluginTrust() error {
 
 	keys, err := plugin.ParseTrustedPluginKeys(trustedKeys)
 	if err != nil {
-		slog.Error("Invalid plugins.trusted_keys; plugin signature verification is disabled", "err", err)
+		slog.Error("Invalid plugins.trusted_keys; refusing unsigned packages", "err", err)
+		s.pluginManager.SetTrust(nil, true)
 		return err
 	}
 	if len(keys) > 0 || requireSigned {

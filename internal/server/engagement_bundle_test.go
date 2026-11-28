@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -502,6 +503,122 @@ func TestEngagementBundleVerify(t *testing.T) {
 	// 4. A body that is not a zip is refused rather than parsed.
 	if code, _ := verify([]byte("not a zip at all")); code != http.StatusBadRequest {
 		t.Fatalf("a non-zip body = %d, want 400", code)
+	}
+}
+
+func TestEngagementBundleVerifyRejectsOversizedMember(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := mustTenantServer(t)
+	now := time.Now()
+	engagement := db.Engagement{TenantID: 1, Name: "bundle limits", StartsAt: now.Add(-time.Hour), EndsAt: now.Add(time.Hour)}
+	if err := s.db.Create(&engagement).Error; err != nil {
+		t.Fatal(err)
+	}
+	var body bytes.Buffer
+	writer := zip.NewWriter(&body)
+	manifest, err := writer.CreateHeader(&zip.FileHeader{Name: "MANIFEST.json", Method: zip.Store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = manifest.Write([]byte(`{}`))
+	if _, err := writer.CreateHeader(&zip.FileHeader{Name: "huge.bin", Method: zip.Store, UncompressedSize64: engagementBundleVerifyMaxMemberBytes + 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw := body.Bytes()
+	nameAt := bytes.LastIndex(raw, []byte("huge.bin"))
+	if nameAt < 46 {
+		t.Fatal("huge member central directory header not found")
+	}
+	binary.LittleEndian.PutUint32(raw[nameAt-46+24:], uint32(engagementBundleVerifyMaxMemberBytes+1))
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/engagements/1/bundle/verify", bytes.NewReader(body.Bytes()))
+	c.Request.Header.Set("Content-Type", "application/zip")
+	c.Params = gin.Params{{Key: "id", Value: itoaUint(engagement.ID)}}
+	c.Set("user", "op")
+	c.Set("user_role", db.RoleAdmin)
+	c.Set("user_id", uint(1))
+	c.Set(middleware.TenantIDContextKey, uint(1))
+	s.handleVerifyEngagementBundle(c)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized member status = %d, want 413; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestEngagementBundleVerifyRejectsTooManyMembers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := mustTenantServer(t)
+	now := time.Now()
+	engagement := db.Engagement{TenantID: 1, Name: "bundle member count", StartsAt: now.Add(-time.Hour), EndsAt: now.Add(time.Hour)}
+	if err := s.db.Create(&engagement).Error; err != nil {
+		t.Fatal(err)
+	}
+	var body bytes.Buffer
+	writer := zip.NewWriter(&body)
+	for i := 0; i <= engagementBundleVerifyMaxMembers; i++ {
+		if _, err := writer.Create(fmt.Sprintf("member-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/engagements/1/bundle/verify", bytes.NewReader(body.Bytes()))
+	c.Request.Header.Set("Content-Type", "application/zip")
+	c.Params = gin.Params{{Key: "id", Value: itoaUint(engagement.ID)}}
+	c.Set("user", "op")
+	c.Set("user_role", db.RoleAdmin)
+	c.Set("user_id", uint(1))
+	c.Set(middleware.TenantIDContextKey, uint(1))
+	s.handleVerifyEngagementBundle(c)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("member count status = %d, want 413; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestEngagementBundleVerifyRejectsExcessiveTotalExpansion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := mustTenantServer(t)
+	now := time.Now()
+	engagement := db.Engagement{TenantID: 1, Name: "bundle total size", StartsAt: now.Add(-time.Hour), EndsAt: now.Add(time.Hour)}
+	if err := s.db.Create(&engagement).Error; err != nil {
+		t.Fatal(err)
+	}
+	var body bytes.Buffer
+	writer := zip.NewWriter(&body)
+	for _, name := range []string{"first.bin", "second.bin"} {
+		if _, err := writer.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Store}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw := body.Bytes()
+	for _, name := range []string{"first.bin", "second.bin"} {
+		nameAt := bytes.LastIndex(raw, []byte(name))
+		if nameAt < 46 {
+			t.Fatalf("%s central directory header not found", name)
+		}
+		binary.LittleEndian.PutUint32(raw[nameAt-46+24:], uint32(engagementBundleVerifyMaxTotalBytes/2+1))
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/engagements/1/bundle/verify", bytes.NewReader(raw))
+	c.Request.Header.Set("Content-Type", "application/zip")
+	c.Params = gin.Params{{Key: "id", Value: itoaUint(engagement.ID)}}
+	c.Set("user", "op")
+	c.Set("user_role", db.RoleAdmin)
+	c.Set("user_id", uint(1))
+	c.Set(middleware.TenantIDContextKey, uint(1))
+	s.handleVerifyEngagementBundle(c)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("total expansion status = %d, want 413; body=%s", w.Code, w.Body.String())
 	}
 }
 

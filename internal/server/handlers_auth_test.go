@@ -234,3 +234,28 @@ func TestHandleLogin_InactiveUser(t *testing.T) {
 		t.Fatalf("expected error in response body, got: %s", w.Body.String())
 	}
 }
+
+func TestHandleLoginRejectsCrossSiteOrigin(t *testing.T) {
+	s := newLoginTestServer(t)
+	router := gin.New()
+	router.POST("/login", s.handleLogin)
+	for _, tc := range []struct {
+		name   string
+		origin string
+		want   int
+	}{
+		{name: "cross site", origin: "https://evil.example", want: http.StatusForbidden},
+		{name: "same site", origin: "http://example.com", want: http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "http://example.com/login", strings.NewReader("username=x&password=y"))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Origin", tc.origin)
+			router.ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, tc.want, w.Body.String())
+			}
+		})
+	}
+}

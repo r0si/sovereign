@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,8 +58,31 @@ func (s *Server) renderLoginError(c *gin.Context, errMsg string) {
 	respondError(c, http.StatusUnauthorized, errMsg)
 }
 
-func (s *Server) handleLogin(c *gin.Context) {
+func (s *Server) loginOriginAllowed(c *gin.Context) bool {
+	origin := strings.TrimSpace(c.GetHeader("Origin"))
+	if origin == "" {
+		referer := strings.TrimSpace(c.GetHeader("Referer"))
+		if referer == "" {
+			return true
+		}
+		u, err := url.Parse(referer)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return false
+		}
+		origin = u.Scheme + "://" + u.Host
+	}
+	var allowed []string
+	if s.cfg != nil {
+		allowed = s.cfg.Server.AllowedOrigins
+	}
+	return middleware.OriginAllowed(origin, c.Request.Host, allowed)
+}
 
+func (s *Server) handleLogin(c *gin.Context) {
+	if !s.loginOriginAllowed(c) {
+		respondError(c, http.StatusForbidden, "cross-site login rejected")
+		return
+	}
 	username := c.PostForm("username")
 	password := c.PostForm("password")
 	rememberMe := c.PostForm("remember_me") == "on"
