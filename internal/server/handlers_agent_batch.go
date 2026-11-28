@@ -354,16 +354,18 @@ func (s *Server) handleBatchCommand(c *gin.Context) {
 
 		status := s.resolveInitialTaskStatusFor(req.TaskType, req.CredentialID)
 		row := db.Task{
-			AgentID:        cand.agentID,
-			Type:           req.TaskType,
-			Command:        command,
-			Shell:          req.Shell,
-			Path:           req.File,
-			Data:           req.Args,
-			Status:         status,
-			CreatedBy:      operator,
-			IdempotencyKey: idempotencyKey,
-			TenantID:       tenantByAgent[cand.agentID],
+			AgentID:                cand.agentID,
+			Type:                   req.TaskType,
+			Command:                command,
+			Shell:                  req.Shell,
+			Path:                   req.File,
+			Data:                   req.Args,
+			Status:                 status,
+			Priority:               1,
+			CreatedBy:              operator,
+			IdempotencyKey:         idempotencyKey,
+			TenantID:               tenantByAgent[cand.agentID],
+			IdempotencyFingerprint: canonicalTaskFingerprint(cand.agentID, req.TaskType, command, req.Shell, fingerprintPath, fingerprintData, 0, 0, batchRef, taskOptions{}),
 		}
 		if batchRef.ID != 0 {
 			id := batchRef.ID

@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/r0si/sovereign/internal/db"
+	"gorm.io/gorm"
 )
 
 // Engagements: the time-boxed container above a tenant.
@@ -157,37 +158,61 @@ func (s *Server) handleCloseEngagement(c *gin.Context) {
 		respondError(c, http.StatusConflict, "engagement is already closed")
 		return
 	}
+	var req struct {
+		StampAgents bool `json:"stamp_agents"`
+	}
+	_ = c.ShouldBindJSON(&req) // an absent body is the normal case
 	now := time.Now().UTC()
-	if err := s.db.WithContext(s.ctx).Model(&db.Engagement{}).Where("id = ?", engagement.ID).
-		Update("closed_at", now).Error; err != nil {
+	var convergence dispatchConvergence
+	stamped := 0
+	closed := false
+	err := s.db.WithContext(s.ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&db.Engagement{}).Where("id = ? AND closed_at IS NULL", engagement.ID).
+			Update("closed_at", now)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil
+		}
+		closed = true
+		var agents []db.Implant
+		if err := tx.Select(dispatchAgentColumns).Where("engagement_id = ?", engagement.ID).Find(&agents).Error; err != nil {
+			return err
+		}
+		for _, agent := range agents {
+			result, err := s.convergeAgentDispatch(tx, agent, now, "system")
+			if err != nil {
+				return err
+			}
+			convergence.cancelled = append(convergence.cancelled, result.cancelled...)
+			convergence.aborts = append(convergence.aborts, result.aborts...)
+		}
+		if req.StampAgents {
+			res := tx.Model(&db.Implant{}).Where("engagement_id = ?", engagement.ID).Update("expires_at", now)
+			if res.Error != nil {
+				return res.Error
+			}
+			stamped = int(res.RowsAffected)
+		}
+		return nil
+	})
+	if err != nil {
+		s.releaseDispatchConvergence(convergence)
 		handleQueryError(c, err, "Failed to close the engagement")
 		return
 	}
+	if !closed {
+		respondError(c, http.StatusConflict, "engagement is already closed")
+		return
+	}
+	s.applyDispatchConvergence(convergence)
 	engagement.ClosedAt = &now
 	// The original window stays in the record: closing early is a decision, not an edit of history.
 	s.LogAuditRecord(c, "engagement_close", "engagement", fmt.Sprintf("%d", engagement.ID),
 		fmt.Sprintf("engagement %q closed early (agreed window ended %s)", engagement.Name,
 			engagement.EndsAt.Format(time.RFC3339)), true, nil)
-
-	// Opt-in: stamp the closing instant onto every member host, so the deadline lives on the AGENT as well as on the
-	// exercise. Dispatch already refuses tasks once an engagement is closed, so this is defence in depth - but it is the
-	// difference between "this host is done because its exercise is" and "this host is done", which is what an operator
-	// reading the agent list needs. Opt-in rather than default: a close is a bookkeeping decision and must not silently
-	// write 40 agent rows.
-	var req struct {
-		StampAgents bool `json:"stamp_agents"`
-	}
-	_ = c.ShouldBindJSON(&req) // an absent body is the normal case
-	stamped := 0
 	if req.StampAgents {
-		result := s.db.WithContext(s.ctx).Model(&db.Implant{}).
-			Where("engagement_id = ?", engagement.ID).
-			Update("expires_at", now)
-		if result.Error != nil {
-			handleQueryError(c, result.Error, "Failed to stamp the agent deadlines")
-			return
-		}
-		stamped = int(result.RowsAffected)
 		s.LogAuditRecord(c, "engagement_close_stamp", "engagement", fmt.Sprintf("%d", engagement.ID),
 			fmt.Sprintf("stamped the close of %q onto %d member host(s)", engagement.Name, stamped), true, nil)
 	}

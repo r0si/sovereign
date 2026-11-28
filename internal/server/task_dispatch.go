@@ -16,9 +16,9 @@ import (
 	"github.com/r0si/sovereign/internal/plugin"
 	"github.com/r0si/sovereign/pkg/protocol"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
-// getAgentOrFail fetches agent by ID within the caller's tenant scope.
 // On failure writes JSON 404 and returns false.
 func (s *Server) getAgentOrFail(c *gin.Context, id string) (db.Implant, bool) {
 	var agent db.Implant
@@ -56,6 +56,36 @@ type taskOptions struct {
 	// the beacon cannot claim the task before the signature is persisted.
 	fileChainPrev string
 	fileChainMAC  string
+	// resultEncryption is part of the REST request fingerprint even though
+	// the key itself is minted after the row is created.
+	resultEncryption bool
+	taskKey          string
+	systemStatus     string
+	systemCreator    string
+	reserveExtra     int
+	priority         int
+	claimNow         bool
+}
+
+// withSystemTaskMetadata preserves the system caller's approval intent and
+// creator while all persistence/accounting stays in createTask.
+func withSystemTaskMetadata(status, creator string) TaskOption {
+	return func(o *taskOptions) {
+		o.systemStatus = status
+		o.systemCreator = creator
+	}
+}
+
+// withEmergencyAbortReservation gives recall tasks urgent priority and the
+// bounded reserved headroom used by the cancellation endpoint.
+func withEmergencyAbortReservation() TaskOption {
+	return func(o *taskOptions) {
+		if o.reserveExtra < AbortReserveSlots {
+			o.reserveExtra = AbortReserveSlots
+		}
+		o.priority = 3
+		o.claimNow = true
+	}
 }
 
 // WithCaller tags a createTask call with the operator user ID so the
@@ -77,6 +107,82 @@ func WithIdempotencyKey(key string) TaskOption {
 // admin overrides; system paths never set it.
 func WithForceWrite(reason string) TaskOption {
 	return func(o *taskOptions) { o.forceWrite = reason }
+}
+
+// withResultEncryption records the requested result-sealing mode for
+// idempotency comparison without minting or rotating a task key on replay.
+func withResultEncryption(enabled bool) TaskOption {
+	return func(o *taskOptions) { o.resultEncryption = enabled }
+}
+
+func withTaskKey(key string) TaskOption {
+	return func(o *taskOptions) { o.taskKey = key }
+}
+
+var errIdempotencyConflict = errors.New("idempotency key belongs to a different task request")
+
+func canonicalTaskFingerprint(agentID, taskType, command, shell, path, data string, offset, size int64, ref credentialTaskReference, opts taskOptions) string {
+	if ref.ID != 0 {
+		command, shell = ref.Command, ref.Shell
+	}
+	fields := []string{
+		agentID, taskType, command, shell, path, data,
+		strconv.FormatInt(offset, 10), strconv.FormatInt(size, 10),
+		strconv.FormatBool(opts.resultEncryption),
+	}
+	if ref.ID != 0 {
+		fields = append(fields, "credential", strconv.FormatUint(uint64(ref.ID), 10), ref.Fingerprint, ref.Params)
+	}
+	if opts.transferID != nil {
+		fields = append(fields, "transfer", strconv.FormatUint(uint64(*opts.transferID), 10), opts.direction, strconv.FormatBool(opts.final))
+	}
+	if opts.baseTaskID != nil {
+		fields = append(fields, "baseline", strconv.FormatUint(uint64(*opts.baseTaskID), 10), opts.expectedSHA256)
+	}
+	fields = append(fields, opts.fileChainPrev, opts.fileChainMAC)
+	h := sha256.New()
+	for _, field := range fields {
+		fmt.Fprintf(h, "%d:", len(field))
+		_, _ = h.Write([]byte(field))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func storedTaskFingerprint(task db.Task) string {
+	ref := credentialTaskReference{}
+	if task.CredentialID != nil {
+		ref.ID = *task.CredentialID
+		ref.Fingerprint = task.CredentialFingerprint
+		ref.Params = task.CredentialParams
+		ref.Command = task.ResolvedCommand
+		ref.Shell = task.ResolvedShell
+	}
+	opts := taskOptions{
+		resultEncryption: task.TaskKey != "",
+		transferID:       task.TransferID,
+		direction:        task.Direction,
+		final:            task.Final,
+		baseTaskID:       task.BaseTaskID,
+		expectedSHA256:   task.ExpectedSHA256,
+		fileChainPrev:    task.PrevMAC,
+		fileChainMAC:     task.MAC,
+	}
+	return canonicalTaskFingerprint(task.AgentID, task.Type, task.Command, task.Shell, task.Path, task.Data, task.Offset, task.Size, ref, opts)
+}
+
+func replayIdempotentTask(existing db.Task, fingerprint string, ref credentialTaskReference) (*db.Task, error) {
+	stored := existing.IdempotencyFingerprint
+	if stored == "" {
+		stored = storedTaskFingerprint(existing)
+	}
+	if stored != fingerprint {
+		if ref.ID != 0 && (existing.CredentialID == nil || *existing.CredentialID != ref.ID || existing.CredentialFingerprint != ref.Fingerprint) {
+			return nil, errCredentialReferenceConflict
+		}
+		return nil, errIdempotencyConflict
+	}
+	existing.IdempotentReplay = true
+	return &existing, nil
 }
 
 // WithCredentialReference attaches a vault reference to a task. createTask
@@ -131,91 +237,302 @@ func callerOpts(c *gin.Context) []TaskOption {
 	return []TaskOption{WithCaller(u)}
 }
 
-// validateTaskCreation applies every shared gate for new tasks: task-type
-// validity, chrome-agent affinity, Rules-of-Engagement, the lportfwd kill
-// switch, adaptive OPSEC blocking, and the operator soft-lock. Centralizing
-// these keeps the single-task and batch paths consistent so neither can
-// bypass a gate. Creation paths that do not already hold the agent row call
-// this (the RoE gate SELECTs it); batch paths use
-// validateTaskCreationWithAgent to reuse their own batch load.
+// validateTaskCreation checks request validity and creation-only operator
+// locks before calling the shared dispatch-time policy gate.
 func (s *Server) validateTaskCreation(c *gin.Context, agentID, taskType, command, data, path string, callerUserID uint) error {
 	return s.validateTaskCreationWithAgentShell(c, agentID, taskType, command, "", "", data, path, callerUserID, nil)
 }
 
-// validateTaskCreationWithAgent is validateTaskCreation for callers that
-// already hold the agent row (the batch path loads all agents up front):
-// passing preloadedAgent lets the RoE gate check that row in memory instead
-// of re-SELECTing every agent, which is one point query per agent on the
-// single-writer pool. With preloadedAgent == nil it behaves exactly like
-// validateTaskCreation.
+// validateTaskCreationWithAgent preserves the existing call shape for callers
+// without a shell argument. Batch and single creation use the shell-aware form
+// so required shell parameters cannot be bypassed or falsely rejected.
 func (s *Server) validateTaskCreationWithAgent(c *gin.Context, agentID, taskType, command, data, path string, callerUserID uint, preloadedAgent *db.Implant) error {
-	if !IsKnownTaskType(taskType) && !protocol.ValidTaskType(taskType) {
-		return fmt.Errorf("unknown task type: %s", taskType)
-	}
+	return s.validateTaskCreationWithAgentShell(c, agentID, taskType, command, "", "", data, path, callerUserID, preloadedAgent)
+}
 
-	// lportfwd opens a tunneled egress path through the teamserver; honor the
-	// server.lportfwd_enabled kill switch centrally so every creation path
-	// (handlers, bulk, automation, scripting) inherits it.
-	if preloadedAgent != nil {
-		if err := s.checkRoELoaded(*preloadedAgent, taskType, command, data, path); err != nil {
-			return err
-		}
-	} else if err := s.checkRoE(agentID, taskType, command, data, path); err != nil {
+func (s *Server) validateTaskCreationWithAgentShell(c *gin.Context, agentID, taskType, command, shell, expectedSHA256, data, path string, callerUserID uint, preloadedAgent *db.Implant) error {
+	agent, err := s.agentForDispatch(agentID, preloadedAgent)
+	if err != nil {
+		return err
+	}
+	if err := validateTaskArguments(taskType, command, shell, path, data, expectedSHA256); err != nil {
+		return err
+	}
+	if err := s.authorizeTaskDispatch(*agent, taskType, command, data, path); err != nil {
 		return err
 	}
 
-	if (taskType == protocol.TaskTypeLPortFwdStart) && !s.lportFwdAllowed() {
-		slog.Warn("lportfwd task refused: disabled by configuration", "agent_id", agentID)
-		return fmt.Errorf("lportfwd is disabled by server configuration (server.lportfwd_enabled)")
-	}
-
-	// Adaptive OPSEC gate: agents at critical threat level cannot launch
-	// credential-access / injection operations. Enforced at creation so every
-	// path (handlers, bulk, automation, workflow, scripting) inherits the gate.
-	if s.opsecAdaptive != nil && s.opsecAdaptive.ShouldBlockAction(agentID, taskType) {
-		slog.Warn("Task blocked by adaptive opsec (critical threat level)",
-			"agent_id", agentID, "task_type", taskType)
-		s.LogAuditRecord(nil, "opsec_block", "agent", agentID,
-			"blocked "+taskType+" (critical threat level)", false, nil)
-		return fmt.Errorf("blocked by adaptive opsec: %s is not allowed on a critical-threat host", taskType)
-	}
-
-	// Engagement deadline: an implant built from a secret with an expiry must stop accepting work when
-	// that deadline passes. Enforced here, at the single creation gate every path goes through, so a
-	// handler, a bulk action, an automation rule and a script cannot disagree about it.
-	if agent := s.agentForExpiryCheck(agentID, preloadedAgent); agent != nil {
-		// Load the engagement ONCE: the same row answers "has the window opened" and "has it closed".
-		engagement := s.engagementFor(*agent)
-		if s.engagementNotStarted(*agent, engagement, time.Now()) {
-			// The end of the window was enforced in an earlier round; refusing to start early is the
-			// symmetric half, and without it the agreed window does not bound anything on the left.
-			slog.Warn("Task refused: engagement has not started", "agent_id", agentID, "task_type", taskType,
-				"starts_at", engagement.StartsAt.UTC().Format(time.RFC3339))
-			s.LogAuditRecord(nil, "agent_not_started_block", "agent", agentID,
-				fmt.Sprintf("refused %s: engagement starts %s", taskType, engagement.StartsAt.UTC().Format(time.RFC3339)), false, nil)
-			return fmt.Errorf("agent not in scope yet: the engagement for this implant starts at %s",
-				engagement.StartsAt.UTC().Format(time.RFC3339))
-		}
-		if deadline := effectiveDeadlineFor(*agent, engagement); deadline != nil && time.Now().After(*deadline) {
-			// Name the EFFECTIVE deadline: it may be the engagement window rather than the implant own,
-			// and an operator needs to know which one stopped the work.
-			when := deadline.UTC().Format(time.RFC3339)
-			slog.Warn("Task refused: agent engagement expired", "agent_id", agentID, "task_type", taskType, "deadline", when)
-			s.LogAuditRecord(nil, "agent_expired_block", "agent", agentID,
-				fmt.Sprintf("refused %s: deadline passed (%s)", taskType, when), false, nil)
-			return fmt.Errorf("agent expired: the engagement deadline for this implant passed at %s", when)
-		}
-	}
-
-	// Soft-lock: if another operator is actively viewing this agent, reject
-	// the task to prevent conflicting concurrent commands.
+	// Creation-only soft-lock: approval and claim must not inherit a stale
+	// operator browsing session from the time the task was originally created.
 	if callerUserID != 0 && s.operatorSessions != nil {
 		if others := s.operatorSessions.ActiveOperatorsForAgent(agentID, callerUserID); len(others) > 0 {
 			return fmt.Errorf("agent conflict: %s is being actively operated by %s", agentID, joinUsernames(others))
 		}
 	}
-
 	return nil
+}
+
+// validateTaskArguments is shared by operator, system and batched creation.
+// It validates the complete request without applying dispatch-time policy.
+func validateTaskArguments(taskType, command, shell, path, data, expectedSHA256 string) error {
+	if !IsKnownTaskType(taskType) && !protocol.ValidTaskType(taskType) {
+		return taskRequestErrorf("unknown task type: %s", taskType)
+	}
+	if len(command) > MaxCommandLength {
+		return taskRequestErrorf("command too long (max %d characters)", MaxCommandLength)
+	}
+	info, ok := getTaskTypeInfo(taskType)
+	if !ok {
+		return nil
+	}
+	for _, p := range info.Parameters {
+		if !p.Required {
+			continue
+		}
+		value := command
+		switch p.Name {
+		case "shell":
+			value = shell
+		case "path":
+			value = path
+		case "expected_sha256":
+			value = expectedSHA256
+		case "data":
+			value = data
+		case "command":
+		default:
+			continue
+		}
+		if value == "" {
+			return taskRequestErrorf("task type %s requires '%s' parameter", taskType, p.Name)
+		}
+	}
+	return nil
+}
+
+// emergencyDispatchTask is the complete emergency allowlist. These tasks may
+// bypass the armed kill-switch and engagement/implant deadline so recall and
+// self-destruction remain deliverable; RoE, OPSEC and argument checks still run.
+func emergencyDispatchTask(taskType string) bool {
+	return taskType == protocol.TaskTypeAbort || taskType == protocol.TaskTypeKill || taskType == protocol.TaskTypeUninstall
+}
+
+// authorizeTaskDispatch is the pure dispatch policy gate used by creation,
+// approval and both beacon claim paths. The implant must already be loaded;
+// all lookup failures are returned to the caller rather than treated as an
+// unconstrained implant.
+func (s *Server) authorizeTaskDispatch(agent db.Implant, taskType, command, data, path string) error {
+	return s.authorizeTaskDispatchOn(agent, taskType, command, data, path, s.db, true)
+}
+
+func agentSupportsTaskType(agent db.Implant, taskType string) bool {
+	if strings.TrimSpace(agent.TaskTypes) == "" {
+		return true // legacy agents predate capability advertising
+	}
+	canonical, _ := protocol.ResolveAlias(taskType)
+	for _, supported := range strings.Split(agent.TaskTypes, ",") {
+		supported = strings.TrimSpace(supported)
+		if supported == taskType || supported == canonical {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) authorizeTaskDispatchOn(agent db.Implant, taskType, command, data, path string, database *gorm.DB, audit bool) error {
+	if agent.ID == "" {
+		return fmt.Errorf("agent lookup failed: implant not found")
+	}
+	if err := s.checkRoELoaded(agent, taskType, command, data, path); err != nil {
+		return err
+	}
+	if taskType == protocol.TaskTypeLPortFwdStart && !s.lportFwdAllowed() {
+		return fmt.Errorf("lportfwd is disabled by server configuration (server.lportfwd_enabled)")
+	}
+	if s.opsecAdaptive != nil && s.opsecAdaptive.ShouldBlockAction(agent.ID, taskType) {
+		if audit {
+			s.LogAuditRecord(nil, "opsec_block", "agent", agent.ID,
+				"blocked "+taskType+" (critical threat level)", false, nil)
+		}
+		return fmt.Errorf("blocked by adaptive opsec: %s is not allowed on a critical-threat host", taskType)
+	}
+	emergency := emergencyDispatchTask(taskType)
+	if !emergency && !agentSupportsTaskType(agent, taskType) {
+		return fmt.Errorf("agent does not support task type %s", taskType)
+	}
+	armed, _ := s.killSwitchState()
+	if armed && !emergency {
+		return fmt.Errorf("fleet kill-switch is armed; only abort, kill and uninstall tasks may be dispatched")
+	}
+	if emergency {
+		return nil
+	}
+	engagement, err := s.dispatchEngagementOn(agent, database)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	if s.engagementNotStarted(agent, engagement, now) {
+		if audit {
+			s.LogAuditRecord(nil, "agent_not_started_block", "agent", agent.ID,
+				fmt.Sprintf("refused %s: engagement starts %s", taskType, engagement.StartsAt.UTC().Format(time.RFC3339)), false, nil)
+		}
+		return fmt.Errorf("agent not in scope yet: the engagement for this implant starts at %s",
+			engagement.StartsAt.UTC().Format(time.RFC3339))
+	}
+	if deadline := effectiveDeadlineFor(agent, engagement); deadline != nil && now.After(*deadline) {
+		when := deadline.UTC().Format(time.RFC3339)
+		if audit {
+			s.LogAuditRecord(nil, "agent_expired_block", "agent", agent.ID,
+				fmt.Sprintf("refused %s: deadline passed (%s)", taskType, when), false, nil)
+		}
+		return fmt.Errorf("agent expired: the engagement deadline for this implant passed at %s", when)
+	}
+	return nil
+}
+
+// taskDispatchFields returns the real wire arguments for policy evaluation,
+// including credential-resolved commands which are hidden from task.Command.
+func taskDispatchFields(t db.Task) (command, shell, path, data string, err error) {
+	command, shell, err = taskWireArgs(t)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	return command, shell, t.Path, t.Data, nil
+}
+
+// authorizeStoredTaskDispatch re-evaluates the policy in force now against
+// the task's real wire arguments. It deliberately does not run creation-only
+// soft-lock/AgentLock checks.
+func (s *Server) authorizeStoredTaskDispatch(task db.Task) error {
+	agent, err := s.agentForDispatch(task.AgentID, nil)
+	if err != nil {
+		return err
+	}
+	command, _, path, data, err := taskDispatchFields(task)
+	if err != nil {
+		return err
+	}
+	return s.authorizeTaskDispatch(*agent, task.Type, command, data, path)
+}
+
+// dispatchConvergence records post-commit effects for tasks stopped because
+// their engagement closed or expired. Counters and hooks are applied only
+// after the transaction commits.
+type dispatchConvergence struct {
+	cancelled []db.Task
+	aborts    []db.Task
+}
+
+func dispatchAgentExpiredOn(database *gorm.DB, agent db.Implant, now time.Time) (bool, error) {
+	engagement, err := (&Server{}).dispatchEngagementOn(agent, database)
+	if err != nil {
+		return false, err
+	}
+	deadline := effectiveDeadlineFor(agent, engagement)
+	return deadline != nil && !deadline.IsZero() && !now.Before(*deadline), nil
+}
+
+// convergeAgentDispatch cancels queued work and injects one urgent abort for
+// each running task when an agent's effective deadline has passed. It runs in
+// the caller's transaction so close/claim and convergence cannot interleave.
+func (s *Server) convergeAgentDispatch(tx *gorm.DB, agent db.Implant, now time.Time, creator string) (dispatchConvergence, error) {
+	var out dispatchConvergence
+	expired, err := dispatchAgentExpiredOn(tx, agent, now)
+	if err != nil || !expired {
+		return out, err
+	}
+	// Abort is emergency policy: it remains deliverable in a closed/expired
+	// engagement. Authorize before any task row is changed or inserted.
+	if err := s.authorizeTaskDispatchOn(agent, protocol.TaskTypeAbort, "0", "", "", tx, false); err != nil {
+		return out, err
+	}
+	var live []db.Task
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id, tenant_id, agent_id, type, command, status, error").
+		Where("agent_id = ? AND status IN ?", agent.ID, []string{"pending", TaskStatusPendingApproval, "running"}).
+		Find(&live).Error; err != nil {
+		return out, err
+	}
+	var pendingIDs []uint
+	for _, task := range live {
+		if task.Status == "running" {
+			continue
+		}
+		pendingIDs = append(pendingIDs, task.ID)
+	}
+	if len(pendingIDs) > 0 {
+		res := tx.Model(&db.Task{}).Where("id IN ? AND status IN ?", pendingIDs,
+			[]string{"pending", TaskStatusPendingApproval}).
+			Updates(map[string]interface{}{"status": "cancelled", "error": "engagement closed or expired"})
+		if res.Error != nil {
+			return out, res.Error
+		}
+		for _, task := range live {
+			if task.Status == "running" {
+				continue
+			}
+			task.Status = "cancelled"
+			task.Error = "engagement closed or expired"
+			out.cancelled = append(out.cancelled, task)
+		}
+	}
+	for _, task := range live {
+		if task.Status != "running" {
+			continue
+		}
+		command := strconv.FormatUint(uint64(task.ID), 10)
+		var existing int64
+		if err := tx.Model(&db.Task{}).
+			Where("agent_id = ? AND type = ? AND command = ? AND status IN ?", agent.ID,
+				protocol.TaskTypeAbort, command, []string{"pending", "running"}).Count(&existing).Error; err != nil {
+			return out, err
+		}
+		if existing > 0 {
+			continue
+		}
+		out.aborts = append(out.aborts, db.Task{
+			TenantID: task.TenantID, AgentID: agent.ID, Type: protocol.TaskTypeAbort,
+			Command: command, Status: "pending", Priority: 3, CreatedBy: creator,
+		})
+	}
+	if len(out.aborts) > 0 {
+		// A closing engagement may have many running tasks. Reserve exactly
+		// the emergency headroom needed rather than the normal two slots.
+		if err := s.trackPendingTaskReserved(agent.ID, len(out.aborts)); err != nil {
+			out.aborts = nil
+			return out, err
+		}
+		if err := tx.Create(&out.aborts).Error; err != nil {
+			for range out.aborts {
+				s.decPendingTasks(agent.ID)
+			}
+			out.aborts = nil
+			return out, err
+		}
+	}
+	return out, nil
+}
+
+func (s *Server) applyDispatchConvergence(result dispatchConvergence) {
+	for _, task := range result.cancelled {
+		s.decPendingTasks(task.AgentID)
+		s.broadcastTaskUpdate(task.AgentID, task)
+	}
+	for i := range result.aborts {
+		task := &result.aborts[i]
+		s.fireTaskCreatedHook(task.AgentID, task.ID, task.Type, task.Command)
+		if s.metrics != nil {
+			s.metrics.TasksTotal.Inc()
+		}
+		s.broadcastTaskUpdate(task.AgentID, *task)
+	}
+}
+
+func (s *Server) releaseDispatchConvergence(result dispatchConvergence) {
+	for _, task := range result.aborts {
+		s.decPendingTasks(task.AgentID)
+	}
 }
 
 // isUniqueViolation reports whether err is a unique-constraint violation on
@@ -276,7 +593,16 @@ func (s *Server) createTask(agentID, taskType, command, shell, path, data string
 			data = rd
 		}
 	}
-	if err := s.validateTaskCreation(nil, agentID, taskType, command, data, path, tOpts.callerUserID); err != nil {
+	// Clamp before validation so policy and the persisted request see the
+	// same bounded command.
+	if taskType == protocol.TaskTypeSetSleep {
+		var err error
+		command, err = clampSetSleepCommand(command)
+		if err != nil {
+			return nil, &taskRequestError{msg: err.Error()}
+		}
+	}
+	if err := s.validateTaskCreationWithAgentShell(nil, agentID, taskType, command, shell, tOpts.expectedSHA256, data, path, tOpts.callerUserID, nil); err != nil {
 		return nil, &taskRequestError{msg: err.Error()}
 	}
 
@@ -284,24 +610,6 @@ func (s *Server) createTask(agentID, taskType, command, shell, path, data string
 	// this call carries an explicit admin force override (audited inside).
 	if err := s.checkAgentLockForCreate(agentID, &tOpts); err != nil {
 		return nil, &taskRequestError{msg: err.Error()}
-	}
-
-	if len(command) > MaxCommandLength {
-		return nil, taskRequestErrorf("command too long (max %d characters)", MaxCommandLength)
-	}
-
-	// set_sleep bounds: the agent rejects interval <= 0 but honors absurd
-	// values — a huge interval parks the agent for years, a huge jitter
-	// swings sleeps negative (floored to zero) into a beacon-hammering tight
-	// loop. Clamp centrally so every creation path (operator API, batch,
-	// macros, scheduler, rerun) inherits the same floors/ceilings as the
-	// automation and AI paths already enforce.
-	if taskType == "set_sleep" {
-		var err error
-		command, err = clampSetSleepCommand(command)
-		if err != nil {
-			return nil, &taskRequestError{msg: err.Error()}
-		}
 	}
 
 	// Idempotency: a live task with the same key short-circuits creation.
@@ -318,53 +626,24 @@ func (s *Server) createTask(agentID, taskType, command, shell, path, data string
 		if err := s.db.Where("agent_id = ? AND idempotency_key = ? AND status IN ?",
 			agentID, key, []string{"pending", TaskStatusPendingApproval, "running"}).
 			Order("id DESC").First(&existing).Error; err == nil {
-			if ref.ID == 0 {
-				existing.IdempotentReplay = true
-				return &existing, nil
-			}
-			if existing.Type == taskType && existing.CredentialID != nil &&
-				*existing.CredentialID == ref.ID && existing.CredentialFingerprint == ref.Fingerprint {
-				existing.IdempotentReplay = true
-				return &existing, nil
-			}
-			return nil, errCredentialReferenceConflict
+			return replayIdempotentTask(existing, idempotencyFingerprint, ref)
 		}
 		tOpts.idempotencyKey = key
 	}
 
-	if info, ok := getTaskTypeInfo(taskType); ok {
-		for _, p := range info.Parameters {
-			if p.Required {
-				switch p.Name {
-				case "command":
-					if command == "" {
-						return nil, taskRequestErrorf("task type %s requires 'command' parameter", taskType)
-					}
-				case "shell":
-					if shell == "" {
-						return nil, taskRequestErrorf("task type %s requires 'shell' parameter", taskType)
-					}
-				case "path":
-					if path == "" {
-						return nil, taskRequestErrorf("task type %s requires 'path' parameter", taskType)
-					}
-				case "data":
-					if data == "" {
-						return nil, taskRequestErrorf("task type %s requires 'data' parameter", taskType)
-					}
-				}
-			}
-		}
-	}
-
 	s.agentPendingTasksMu.Lock()
 	pending := s.agentPendingTasks[agentID]
-	if pending >= MaxPendingTasksPerAgent {
+	limit := MaxPendingTasksPerAgent + tOpts.reserveExtra
+	if pending >= limit {
 		s.agentPendingTasksMu.Unlock()
-		return nil, taskRequestErrorf("agent %s has %d pending tasks (limit %d)", agentID, pending, MaxPendingTasksPerAgent)
+		return nil, taskRequestErrorf("agent %s has %d pending tasks (limit %d)", agentID, pending, limit)
 	}
 	s.agentPendingTasks[agentID] = pending + 1
 	s.agentPendingTasksMu.Unlock()
+	priority := tOpts.priority
+	if priority == 0 {
+		priority = 1
+	}
 
 	task := db.Task{
 		AgentID:        agentID,
@@ -376,6 +655,7 @@ func (s *Server) createTask(agentID, taskType, command, shell, path, data string
 		Offset:         offset,
 		Size:           size,
 		Status:         "pending",
+		Priority:       priority,
 		TransferID:     tOpts.transferID,
 		Direction:      tOpts.direction,
 		Final:          tOpts.final,
@@ -384,6 +664,12 @@ func (s *Server) createTask(agentID, taskType, command, shell, path, data string
 		TaskKey:        tOpts.taskKey,
 		PrevMAC:        tOpts.fileChainPrev,
 		MAC:            tOpts.fileChainMAC,
+		CreatedBy:      tOpts.systemCreator,
+	}
+	if tOpts.claimNow {
+		now := time.Now()
+		task.ClaimedBy = agentID
+		task.ClaimedAt = now
 	}
 	if ref.ID != 0 {
 		id := ref.ID
@@ -400,16 +686,24 @@ func (s *Server) createTask(agentID, taskType, command, shell, path, data string
 	// (handleGetTaskStatus/apiGetTask) see the row. Previously tasks were
 	// always tenant 0 while operators sit on tenant 1, so list (agent-gated,
 	// no task-tenant filter) showed tasks that single-fetch 404d.
-	var ag db.Implant
-	if err := s.db.Select("tenant_id").Where("id = ?", agentID).First(&ag).Error; err == nil {
-		task.TenantID = ag.TenantID
+	ag, err := s.agentForDispatch(agentID, nil)
+	if err != nil {
+		s.decPendingTasks(agentID)
+		return nil, err
 	}
+	task.TenantID = ag.TenantID
 	if tOpts.idempotencyKey != "" {
 		task.IdempotencyKey = tOpts.idempotencyKey
 		task.IdempotencyFingerprint = idempotencyFingerprint
 	}
 
 	task.Status = s.resolveInitialTaskStatusFor(taskType, tOpts.credentialID)
+	if tOpts.systemStatus == TaskStatusPendingApproval {
+		task.Status = TaskStatusPendingApproval
+	}
+	if tOpts.claimNow {
+		task.Status = "running"
+	}
 	if task.Status == TaskStatusPendingApproval {
 		exp := time.Now().Add(ApprovalExpiryDuration)
 		task.ApprovalExpiresAt = &exp
@@ -455,61 +749,29 @@ func (s *Server) createTask(agentID, taskType, command, shell, path, data string
 	return &task, nil
 }
 
-// createSystemTask inserts a task from a non-operator path (automation
-// rules, AI tools, abort injection helpers) with the same accounting
-// createTask applies: per-agent cap via the shared counter, tenant
-// inheritance, the task_created plugin hook, and TasksTotal.
-//
-// Approval routing and broadcast stay the caller's job: the caller computes
-// status (pending vs pending_approval) before calling, and broadcasts when
-// appropriate. Operator-only gates (RoE, collab soft-lock) are intentionally
-// not applied — system paths are not interactive operators.
+// createSystemTask delegates to createTask so automation, AI, retry and
+// configuration tasks cannot bypass type/parameter, command bounds, policy,
+// approval, tenant, capacity, hook or metric semantics. Only creator and an
+// explicit pending_approval intent differ from operator creation.
 func (s *Server) createSystemTask(agentID, taskType, command, shell, status, createdBy string) (*db.Task, error) {
 	return s.createSystemTaskWithData(agentID, taskType, command, shell, "", status, createdBy)
 }
 
-// createSystemTaskWithData is the Data-carrying form of createSystemTask for
-// system tasks whose payload is a structured blob (profile rotation, config
-// push). Same accounting as createSystemTask.
 func (s *Server) createSystemTaskWithData(agentID, taskType, command, shell, data, status, createdBy string) (*db.Task, error) {
 	if agentID == "" {
-		return nil, fmt.Errorf("agent id required")
+		return nil, taskRequestErrorf("agent id required")
 	}
 	if taskType == "" {
-		return nil, fmt.Errorf("task type required")
+		return nil, taskRequestErrorf("task type required")
 	}
 	if status == "" {
 		status = "pending"
 	}
 	if status != "pending" && status != TaskStatusPendingApproval {
-		return nil, fmt.Errorf("invalid system task status %q", status)
+		return nil, taskRequestErrorf("invalid system task status %q", status)
 	}
-	if err := s.trackPendingTask(agentID); err != nil {
-		return nil, err
-	}
-	task := db.Task{
-		AgentID: agentID, Type: taskType, Command: command,
-		Shell: shell, Data: data, Status: status, CreatedBy: createdBy,
-	}
-	// Same tenant inheritance as createTask: without it tenant-scoped
-	// single-task reads 404 on system-created rows.
-	var ag db.Implant
-	if err := s.db.Select("tenant_id").Where("id = ?", agentID).First(&ag).Error; err == nil {
-		task.TenantID = ag.TenantID
-	}
-	if status == TaskStatusPendingApproval {
-		exp := time.Now().Add(ApprovalExpiryDuration)
-		task.ApprovalExpiresAt = &exp
-	}
-	if err := s.db.Create(&task).Error; err != nil {
-		s.decPendingTasks(agentID)
-		return nil, err
-	}
-	s.fireTaskCreatedHook(agentID, task.ID, taskType, command)
-	if s.metrics != nil {
-		s.metrics.TasksTotal.Inc()
-	}
-	return &task, nil
+	return s.createTask(agentID, taskType, command, shell, "", data, 0, 0,
+		withSystemTaskMetadata(status, createdBy))
 }
 
 // fireTaskCreatedHook runs the task_created plugin hook best-effort in the
@@ -1135,21 +1397,28 @@ func (s *Server) rejectExpiredApprovals() {
 		slog.Error("Failed to reject expired approvals", "count", len(ids), "error", res.Error)
 		return
 	}
-	flippedAppr := make(map[uint]bool, len(ids))
-	for _, id := range ids {
-		flippedAppr[id] = true
+	flipped := make(map[uint]bool, len(ids))
+	if res.RowsAffected == int64(len(ids)) {
+		for _, id := range ids {
+			flipped[id] = true
+		}
+	} else {
+		var rows []db.Task
+		if err := s.db.Select("id").Where("id IN ? AND status = ? AND error = ?",
+			ids, "cancelled", approvalExpiredError).Find(&rows).Error; err == nil {
+			for _, row := range rows {
+				flipped[row.ID] = true
+			}
+		}
 	}
-	if res.RowsAffected != int64(len(ids)) {
-		flippedAppr, _ = s.flippedSet(ids, "cancelled")
-	}
-	for _, t := range stale {
-		if !flippedAppr[t.ID] {
+	for _, task := range stale {
+		if !flipped[task.ID] {
 			continue
 		}
-		t.Status = "cancelled"
-		t.Error = "approval expired without a second operator"
-		s.broadcastTaskUpdate(t.AgentID, t)
-		s.decPendingTasks(t.AgentID)
+		task.Status = "cancelled"
+		task.Error = approvalExpiredError
+		s.broadcastTaskUpdate(task.AgentID, task)
+		s.decPendingTasks(task.AgentID)
 	}
 	s.LogAuditRecord(nil, "approval_expired", "task", "", "auto-rejected stale approvals", true, nil)
 	s.DispatchNotification(&db.Notification{
@@ -1365,9 +1634,11 @@ func clientErrorStatus(err error) (int, bool) {
 		strings.Contains(msg, "lportfwd is disabled"),
 		strings.Contains(msg, "blocked by adaptive opsec"),
 		strings.Contains(msg, "agent expired"),
-		strings.Contains(msg, "agent not in scope yet"):
+		strings.Contains(msg, "agent not in scope yet"),
+		strings.Contains(msg, "fleet kill-switch is armed"):
 		return http.StatusForbidden, true
 	case strings.Contains(msg, "unknown task type"),
+		strings.Contains(msg, "does not support task type"),
 		strings.Contains(msg, "requires 'command' parameter"),
 		strings.Contains(msg, "requires 'shell' parameter"),
 		strings.Contains(msg, "requires 'path' parameter"),
@@ -1386,55 +1657,62 @@ func clientErrorStatus(err error) (int, bool) {
 	return 0, false
 }
 
-// agentForExpiryCheck returns the agent row used to evaluate the engagement deadline, reusing an
-// already-loaded row when the caller has one.
-func (s *Server) agentForExpiryCheck(agentID string, preloaded *db.Implant) *db.Implant {
+// agentForDispatch loads every field which can affect dispatch policy. A
+// caller-supplied row is trusted only when it came from a complete projection;
+// batch/fleet/campaign loads use dispatchAgentColumns below.
+func (s *Server) agentForDispatch(agentID string, preloaded *db.Implant) (*db.Implant, error) {
 	if preloaded != nil {
-		return preloaded
+		if preloaded.ID == "" {
+			preloaded.ID = agentID
+		}
+		return preloaded, nil
 	}
 	var agent db.Implant
-	// engagement_id must be projected: without it the merged deadline silently ignored the engagement
-	// and the whole feature was inert on the real path (the enforcement test caught exactly that).
-	if err := s.db.Select("id", "expires_at", "engagement_id").Where("id = ?", agentID).First(&agent).Error; err != nil {
-		return nil
+	if err := s.db.Select(dispatchAgentColumns).Where("id = ?", agentID).First(&agent).Error; err != nil {
+		return nil, fmt.Errorf("agent lookup failed for %s: %w", agentID, err)
 	}
-	return &agent
+	return &agent, nil
 }
 
-// agentExpired reports whether the engagement deadline has passed. A nil deadline is unbounded, which
-// keeps every existing installation behaving exactly as before.
+const dispatchAgentColumns = "id, tenant_id, task_types, public_ip, ip, expires_at, engagement_id, kill_date"
+
+// agentExpired is conservative on lookup failure: callers which use this
+// boolean for beacon convergence must not mistake an unreadable engagement for
+// an unbounded one.
 func (s *Server) agentExpired(agent db.Implant) bool {
-	deadline := s.effectiveAgentDeadline(agent)
+	engagement, err := s.dispatchEngagement(agent)
+	if err != nil {
+		return true
+	}
+	deadline := effectiveDeadlineFor(agent, engagement)
 	return deadline != nil && !deadline.IsZero() && time.Now().After(*deadline)
 }
 
-// effectiveAgentDeadline merges the two deadlines an implant can carry: its own (inherited from the
-// registration secret) and the window of the engagement it belongs to. The EARLIER one wins, because
-// the engagement is the promise made to the customer - an implant built to run for a month must still
-// stop when the exercise it belongs to ends, or the next day, whichever is sooner.
-//
-// The engagement lookup only happens when the implant is linked to one, so installations without
-// engagements pay nothing for the feature. A closed engagement ends at ClosedAt, not at its agreed
-// EndsAt: closing early is a decision, and the earlier end is the one that applies.
 func (s *Server) effectiveAgentDeadline(agent db.Implant) *time.Time {
-	return effectiveDeadlineFor(agent, s.engagementFor(agent))
+	engagement, err := s.dispatchEngagement(agent)
+	if err != nil {
+		return nil
+	}
+	return effectiveDeadlineFor(agent, engagement)
 }
 
-// engagementFor loads the engagement an implant belongs to, or nil. One query, shared by the "has it
-// started" check and the deadline merge so a task creation reads the engagement once.
-//
-// An unreadable row returns nil, which means "no engagement constraints": the implant deadline still
-// applies, and a database hiccup must not silently stop work.
-func (s *Server) engagementFor(agent db.Implant) *db.Engagement {
-	if agent.EngagementID == nil {
-		return nil
+// dispatchEngagement fails closed when an associated engagement cannot be
+// loaded. A missing association is genuinely unbounded; an unreadable linked
+// engagement is a policy outage, not permission to dispatch.
+func (s *Server) dispatchEngagement(agent db.Implant) (*db.Engagement, error) {
+	return s.dispatchEngagementOn(agent, s.db)
+}
+
+func (s *Server) dispatchEngagementOn(agent db.Implant, database *gorm.DB) (*db.Engagement, error) {
+	if agent.EngagementID == nil || *agent.EngagementID == 0 {
+		return nil, nil
 	}
 	var engagement db.Engagement
-	if err := s.db.Select("id", "starts_at", "ends_at", "closed_at").
+	if err := database.Select("id, tenant_id, starts_at, ends_at, closed_at").
 		Where("id = ?", *agent.EngagementID).First(&engagement).Error; err != nil {
-		return nil
+		return nil, fmt.Errorf("engagement lookup failed for agent %s: %w", agent.ID, err)
 	}
-	return &engagement
+	return &engagement, nil
 }
 
 // effectiveDeadlineFor merges the implant deadline with an already-loaded engagement window.

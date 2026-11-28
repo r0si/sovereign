@@ -1,13 +1,14 @@
 package server
 
 import (
-import (
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/r0si/sovereign/internal/db"
+	"github.com/r0si/sovereign/pkg/protocol"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -33,64 +34,58 @@ func (s *Server) fetchPendingTasks(uuid string, limits ...int) []task {
 		return nil
 	}
 
-	// Claim and return exactly the same rows. Querying all running tasks after
-	// an update can re-dispatch tasks claimed by an earlier beacon.
-	// Busy-retried: under fleet bursts the single writer loses the race and
-	// a bare failure stalls delivery until the next check-in.
+	var convergence dispatchConvergence
 	if err := s.withBusyRetry("claim", func() error {
 		return s.db.Transaction(func(tx *gorm.DB) error {
-			pending := make([]db.Task, 0, beaconDispatchPrealloc)
-			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-				// Dispatch columns only. Result/Error blobs (up to MaxResultSize
-				// each) are never sent on the wire, so loading them here wastes
-				// I/O and fires a pointless AfterFind AES-GCM decrypt per row on
-				// every beacon. Command/Data/Shell stay loaded because the wire
-				// builder re-encrypts them with the session key below.
-				// "offset" is double-quoted: it is a reserved word in
-				// PostgreSQL and MySQL-style backticks are a syntax error there.
-				Select("id, type, command, shell, path, data, \"offset\", size, prev_mac, mac, task_key, credential_id, credential_fingerprint, resolved_command, resolved_shell, transfer_id, direction, final, result_sha256, expected_sha256").
-				Where("agent_id = ? AND status = ?", uuid, "pending").
-				Where("NOT (type = ? AND (mac = '' OR mac IS NULL))", "upload").
-				Order("priority DESC, created_at ASC").
-				Limit(limit).
-				Find(&pending).Error; err != nil {
+			var agent db.Implant
+			if err := tx.Select(dispatchAgentColumns).Where("id = ?", uuid).First(&agent).Error; err != nil {
+				return fmt.Errorf("dispatch agent lookup failed: %w", err)
+			}
+			result, err := s.convergeAgentDispatch(tx, agent, time.Now(), "system")
+			if err != nil {
 				return err
 			}
-			if len(pending) > 0 {
-				ids := make([]uint, len(pending))
-				for i, pendingTask := range pending {
-					ids[i] = pendingTask.ID
+			convergence.cancelled = append(convergence.cancelled, result.cancelled...)
+			convergence.aborts = append(convergence.aborts, result.aborts...)
+
+			pending := make([]db.Task, 0, beaconDispatchPrealloc)
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select(beaconTaskDispatchColumns).
+				Where("agent_id = ? AND status = ?", uuid, "pending").
+				Where("NOT (type = ? AND (mac = '' OR mac IS NULL))", protocol.TaskTypeUpload).
+				Order("priority DESC, created_at ASC").Limit(limit).Find(&pending).Error; err != nil {
+				return err
+			}
+			ids := make([]uint, 0, len(pending))
+			for _, pendingTask := range pending {
+				if err := s.authorizeBeaconClaim(tx, agent, pendingTask); err != nil {
+					slog.Warn("Beacon task blocked by dispatch policy", "agent_id", uuid, "task_id", pendingTask.ID, "error", err)
+					continue
 				}
-				result := tx.Model(&db.Task{}).
-					Where("id IN ? AND status = ?", ids, "pending").
-					Updates(map[string]interface{}{
-						"status":     "running",
-						"claimed_by": uuid,
-						"claimed_at": time.Now(),
-					})
+				ids = append(ids, pendingTask.ID)
+			}
+			if len(ids) > 0 {
+				result := tx.Model(&db.Task{}).Where("id IN ? AND status = ?", ids, "pending").
+					Updates(map[string]interface{}{"status": "running", "claimed_by": uuid, "claimed_at": time.Now()})
 				if result.Error != nil {
 					return result.Error
 				}
-				if result.RowsAffected < int64(len(ids)) {
-					slog.Debug("Some tasks already claimed by concurrent connection", "agent_id", uuid, "attempted", len(ids), "claimed", result.RowsAffected)
-				}
-				if err := tx.Select("id, type, command, shell, path, data, \"offset\", size, prev_mac, mac, task_key, credential_id, credential_fingerprint, resolved_command, resolved_shell, transfer_id, direction, final, result_sha256, expected_sha256").Where("id IN ? AND status = ? AND claimed_by = ?", ids, "running", uuid).
+				if err := tx.Select(beaconTaskDispatchColumns).
+					Where("id IN ? AND status = ? AND claimed_by = ?", ids, "running", uuid).
 					Order("priority DESC, created_at ASC").Limit(len(ids)).Find(&claimedTasks).Error; err != nil {
 					return err
 				}
 			}
-			// Lost-response recovery: re-carry running tasks this agent claimed
-			// but never acknowledged, oldest first, within the remaining budget.
-			// The agent dedupes by task ID, so redelivery never double-executes.
-			// No status change here: claimed_at still drives the stale sweeps.
-			// The NOT IN guard is load-bearing: without it the rows claimed above
-			// (visible in this transaction) would be selected a second time.
+
+			// Re-carry is another dispatch: apply the same current policy and
+			// never replay creation-only operator locks.
 			if remaining := limit - len(claimedTasks); remaining > 0 {
 				claimedIDs := make([]uint, 0, len(claimedTasks))
 				for _, ct := range claimedTasks {
 					claimedIDs = append(claimedIDs, ct.ID)
 				}
-				q := tx.Select("id, type, command, shell, path, data, \"offset\", size, prev_mac, mac, task_key, credential_id, credential_fingerprint, resolved_command, resolved_shell, transfer_id, direction, final, result_sha256, expected_sha256").Where("agent_id = ? AND status = ? AND claimed_by = ? AND acknowledged_at IS NULL", uuid, "running", uuid)
+				q := tx.Select(beaconTaskDispatchColumns).
+					Where("agent_id = ? AND status = ? AND claimed_by = ? AND acknowledged_at IS NULL", uuid, "running", uuid)
 				if len(claimedIDs) > 0 {
 					q = q.Where("id NOT IN ?", claimedIDs)
 				}
@@ -98,22 +93,28 @@ func (s *Server) fetchPendingTasks(uuid string, limits ...int) []task {
 				if err := q.Order("claimed_at ASC").Limit(remaining).Find(&unacked).Error; err != nil {
 					return err
 				}
-				claimedTasks = append(claimedTasks, unacked...)
+				for _, task := range unacked {
+					if err := s.authorizeBeaconClaim(tx, agent, task); err != nil {
+						slog.Warn("Beacon re-carry blocked by dispatch policy", "agent_id", uuid, "task_id", task.ID, "error", err)
+						continue
+					}
+					claimedTasks = append(claimedTasks, task)
+				}
 			}
 			return nil
 		})
 	}); err != nil {
+		s.releaseDispatchConvergence(convergence)
+		claimedTasks = nil
 		slog.Error("Failed to claim pending tasks", "agent_id", uuid, "error", err)
 	}
+	s.applyDispatchConvergence(convergence)
 
-	// Steady-state (nothing claimed) is Debug; a dispatch that hands work to
-	// an implant stays at Info so the operator log shows command delivery.
 	if len(claimedTasks) > 0 {
 		slog.Info("Beacon fetching pending tasks", "agent_id", uuid, "pending_count", len(claimedTasks))
 	} else {
 		slog.Debug("Beacon fetching pending tasks", "agent_id", uuid, "pending_count", 0)
 	}
-
 	tasks := make([]task, 0, len(claimedTasks))
 	for _, t := range claimedTasks {
 		if t.CredentialID != nil {
@@ -128,26 +129,24 @@ func (s *Server) fetchPendingTasks(uuid string, limits ...int) []task {
 			continue
 		}
 		wire := task{
-			ID:             t.ID,
-			Type:           t.Type,
-			Command:        command,
-			Shell:          shell,
-			Path:           t.Path,
-			Data:           t.Data,
-			Offset:         t.Offset,
-			Size:           t.Size,
-			PrevMAC:        t.PrevMAC,
-			MAC:            t.MAC,
-			Key:            t.TaskKey,
-			TransferID:     t.TransferID,
-			Direction:      t.Direction,
-			Final:          t.Final,
-			ExpectedSHA256: t.ExpectedSHA256,
+			ID: t.ID, Type: t.Type, Command: command, Shell: shell, Path: t.Path, Data: t.Data,
+			Offset: t.Offset, Size: t.Size, PrevMAC: t.PrevMAC, MAC: t.MAC, Key: t.TaskKey,
+			TransferID: t.TransferID, Direction: t.Direction, Final: t.Final, ExpectedSHA256: t.ExpectedSHA256,
 		}
 		encryptTaskPayload(s, uuid, &wire)
 		tasks = append(tasks, wire)
 	}
 	return tasks
+}
+
+const beaconTaskDispatchColumns = "id, agent_id, type, command, shell, path, data, \"offset\", size, prev_mac, mac, task_key, credential_id, credential_fingerprint, resolved_command, resolved_shell, transfer_id, direction, final, result_sha256, expected_sha256"
+
+func (s *Server) authorizeBeaconClaim(tx *gorm.DB, agent db.Implant, task db.Task) error {
+	command, _, path, data, err := taskDispatchFields(task)
+	if err != nil {
+		return err
+	}
+	return s.authorizeTaskDispatchOn(agent, task.Type, command, data, path, tx, false)
 }
 
 // sensitiveTaskTypes are task types whose Command/Data fields can carry
@@ -214,84 +213,102 @@ func encryptTaskPayload(s *Server, agentID string, wire *task) {
 }
 
 func (s *Server) fetchRelayedChildTasks(parentUUID string) []relayedTask {
-	// Only the child ids are needed here. Pluck keeps GORM from materialising
-	// full implant rows (100+ columns each) on every beacon of a relay parent;
-	// with zero children this is one narrow query instead of a wide scan.
 	var childIDs []string
 	if err := s.db.Model(&db.Implant{}).Where("parent_id = ?", parentUUID).Limit(500).Pluck("id", &childIDs).Error; err != nil {
 		slog.Error("Failed to fetch child agents", "parent", parentUUID, "error", err)
+		return nil
 	}
 	if len(childIDs) == 0 {
 		return nil
 	}
 
 	var claimedTasks []db.Task
+	var convergence dispatchConvergence
 	if err := s.withBusyRetry("claim", func() error {
 		return s.db.Transaction(func(tx *gorm.DB) error {
-			pending := make([]db.Task, 0, beaconDispatchPrealloc)
-			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-				// Dispatch columns only, same as fetchPendingTasks: result/error
-				// blobs never reach the wire and their AfterFind decrypt is pure
-				// waste per claimed child task. agent_id is needed for grouping.
-				Select("id, agent_id, type, command, shell, path, data, \"offset\", size, prev_mac, mac, task_key, credential_id, credential_fingerprint, resolved_command, resolved_shell, transfer_id, direction, final, result_sha256, expected_sha256").
-				Where("agent_id IN ? AND status = ?", childIDs, "pending").
-				Where("NOT (type = ? AND (mac = '' OR mac IS NULL))", "upload").
-				Order("priority DESC, created_at ASC").
-				Limit(BeaconTaskFetchLimit).
-				Find(&pending).Error; err != nil {
+			var agents []db.Implant
+			if err := tx.Select(dispatchAgentColumns).Where("id IN ?", childIDs).Find(&agents).Error; err != nil {
 				return err
 			}
-			if len(pending) > 0 {
-				ids := make([]uint, len(pending))
-				for i, pendingTask := range pending {
-					ids[i] = pendingTask.ID
+			byID := make(map[string]db.Implant, len(agents))
+			for _, agent := range agents {
+				byID[agent.ID] = agent
+				result, err := s.convergeAgentDispatch(tx, agent, time.Now(), "system")
+				if err != nil {
+					return err
 				}
-				if result := tx.Model(&db.Task{}).Where("id IN ? AND status = ?", ids, "pending").Updates(map[string]interface{}{
-					"status": "running", "claimed_by": parentUUID, "claimed_at": time.Now(),
-				}); result.Error != nil {
-					return result.Error
+				convergence.cancelled = append(convergence.cancelled, result.cancelled...)
+				convergence.aborts = append(convergence.aborts, result.aborts...)
+			}
+			pending := make([]db.Task, 0, beaconDispatchPrealloc)
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select(beaconTaskDispatchColumns).
+				Where("agent_id IN ? AND status = ?", childIDs, "pending").
+				Where("NOT (type = ? AND (mac = '' OR mac IS NULL))", protocol.TaskTypeUpload).
+				Order("priority DESC, created_at ASC").Limit(BeaconTaskFetchLimit).Find(&pending).Error; err != nil {
+				return err
+			}
+			ids := make([]uint, 0, len(pending))
+			for _, task := range pending {
+				agent, ok := byID[task.AgentID]
+				if !ok {
+					return fmt.Errorf("dispatch agent lookup failed for %s", task.AgentID)
 				}
-				// Same claimed_by filter as fetchPendingTasks: SQLite silently drops
-				// FOR UPDATE row locks, so selecting all ids after the update could
-				// re-dispatch tasks another concurrent parent beacon had already won.
-				if err := tx.Where("id IN ? AND status = ? AND claimed_by = ?", ids, "running", parentUUID).
+				if err := s.authorizeBeaconClaim(tx, agent, task); err != nil {
+					slog.Warn("Relayed task blocked by dispatch policy", "agent_id", task.AgentID, "task_id", task.ID, "error", err)
+					continue
+				}
+				ids = append(ids, task.ID)
+			}
+			if len(ids) > 0 {
+				if err := tx.Model(&db.Task{}).Where("id IN ? AND status = ?", ids, "pending").
+					Updates(map[string]interface{}{"status": "running", "claimed_by": parentUUID, "claimed_at": time.Now()}).Error; err != nil {
+					return err
+				}
+				if err := tx.Select(beaconTaskDispatchColumns).
+					Where("id IN ? AND status = ? AND claimed_by = ?", ids, "running", parentUUID).
 					Order("priority DESC, created_at ASC").Limit(len(ids)).Find(&claimedTasks).Error; err != nil {
 					return err
 				}
 			}
-			// Lost-response recovery for relayed children, mirroring
-			// fetchPendingTasks (agent dedupes by task ID). NOT IN guard excludes
-			// the rows claimed above within this transaction.
 			if remaining := BeaconTaskFetchLimit - len(claimedTasks); remaining > 0 {
 				claimedIDs := make([]uint, 0, len(claimedTasks))
-				for _, ct := range claimedTasks {
-					claimedIDs = append(claimedIDs, ct.ID)
+				for _, task := range claimedTasks {
+					claimedIDs = append(claimedIDs, task.ID)
 				}
-				q := tx.Where("agent_id IN ? AND status = ? AND claimed_by = ? AND acknowledged_at IS NULL", childIDs, "running", parentUUID)
+				q := tx.Select(beaconTaskDispatchColumns).
+					Where("agent_id IN ? AND status = ? AND claimed_by = ? AND acknowledged_at IS NULL", childIDs, "running", parentUUID)
 				if len(claimedIDs) > 0 {
 					q = q.Where("id NOT IN ?", claimedIDs)
 				}
 				unacked := make([]db.Task, 0, beaconDispatchPrealloc)
-				if err := q.Select("id, agent_id, type, command, shell, path, data, \"offset\", size, prev_mac, mac, task_key, credential_id, credential_fingerprint, resolved_command, resolved_shell, transfer_id, direction, final, result_sha256, expected_sha256").
-					Order("claimed_at ASC").Limit(remaining).Find(&unacked).Error; err != nil {
+				if err := q.Order("claimed_at ASC").Limit(remaining).Find(&unacked).Error; err != nil {
 					return err
 				}
-				claimedTasks = append(claimedTasks, unacked...)
+				for _, task := range unacked {
+					agent, ok := byID[task.AgentID]
+					if !ok {
+						return fmt.Errorf("dispatch agent lookup failed for %s", task.AgentID)
+					}
+					if err := s.authorizeBeaconClaim(tx, agent, task); err != nil {
+						slog.Warn("Relayed re-carry blocked by dispatch policy", "agent_id", task.AgentID, "task_id", task.ID, "error", err)
+						continue
+					}
+					claimedTasks = append(claimedTasks, task)
+				}
 			}
 			return nil
 		})
 	}); err != nil {
+		s.releaseDispatchConvergence(convergence)
 		slog.Error("Failed to batch claim child tasks", "parent", parentUUID, "error", err)
 		return nil
 	}
+	s.applyDispatchConvergence(convergence)
 
-	// Group by agent_id
 	tasksByAgent := make(map[string][]db.Task, len(childIDs))
-	for _, t := range claimedTasks {
-		agentID := strings.ToLower(t.AgentID)
-		tasksByAgent[agentID] = append(tasksByAgent[agentID], t)
+	for _, task := range claimedTasks {
+		tasksByAgent[strings.ToLower(task.AgentID)] = append(tasksByAgent[strings.ToLower(task.AgentID)], task)
 	}
-
 	var relayed []relayedTask
 	for _, childID := range childIDs {
 		tasks := tasksByAgent[strings.ToLower(childID)]
@@ -312,24 +329,10 @@ func (s *Server) fetchRelayedChildTasks(parentUUID string) []relayedTask {
 				continue
 			}
 			wire := task{
-				ID:             t.ID,
-				Type:           t.Type,
-				Command:        command,
-				Shell:          shell,
-				Path:           t.Path,
-				Data:           t.Data,
-				Offset:         t.Offset,
-				Size:           t.Size,
-				PrevMAC:        t.PrevMAC,
-				MAC:            t.MAC,
-				Key:            t.TaskKey,
-				TransferID:     t.TransferID,
-				Direction:      t.Direction,
-				Final:          t.Final,
-				ExpectedSHA256: t.ExpectedSHA256,
+				ID: t.ID, Type: t.Type, Command: command, Shell: shell, Path: t.Path, Data: t.Data,
+				Offset: t.Offset, Size: t.Size, PrevMAC: t.PrevMAC, MAC: t.MAC, Key: t.TaskKey,
+				TransferID: t.TransferID, Direction: t.Direction, Final: t.Final, ExpectedSHA256: t.ExpectedSHA256,
 			}
-			// Child tasks travel inside the parent's response, so their
-			// sensitive fields are encrypted with the CHILD's session key.
 			if s.sessionManager != nil && s.sessionManager.HasSession(childID) {
 				encryptTaskPayload(s, childID, &wire)
 			}
