@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/r0si/sovereign/internal/db"
+	"github.com/r0si/sovereign/internal/server/middleware"
 )
 
 type apiKeyResponse struct {
@@ -49,7 +50,7 @@ func generateAPIKey() (plaintext string, hash string, prefix string, err error) 
 // creator reaching this handler may grant it. Admins may grant everything.
 func (s *Server) keyCreatorMayGrant(c *gin.Context, scopesCSV string) bool {
 	if c.GetString("user_role") == db.RoleAdmin {
-		return true
+		return !middleware.IsScopedAPIKey(c)
 	}
 	role := c.GetString("user_role")
 	for _, p := range strings.Split(scopesCSV, ",") {

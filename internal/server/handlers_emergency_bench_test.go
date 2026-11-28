@@ -64,7 +64,9 @@ func benchKillSwitchArm(b *testing.B, n int) {
 		s.agentPendingTasksMu.Lock()
 		s.agentPendingTasks = make(map[string]int)
 		s.agentPendingTasksMu.Unlock()
-		s.setKillSwitch(false, "", "bench")
+		if err := s.setKillSwitch(false, "", "bench"); err != nil {
+			b.Fatalf("disarm kill switch: %v", err)
+		}
 		b.StartTimer()
 
 		w := arm()

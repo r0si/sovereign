@@ -250,15 +250,38 @@ func readFileUpload(c *gin.Context, fieldName string) ([]byte, string, bool) {
 
 // --- #6: DB lookup helper ---
 
-// requireAdmin checks that the current user is an admin. Returns false and sends
-// a 403 response if not.
+// requireAdmin checks that the current user is an admin. Scoped API keys never
+// satisfy identity-role gates, even when their owner is an admin.
 func (s *Server) requireAdmin(c *gin.Context) bool {
 	role, _ := c.Get("user_role")
-	if role != "admin" {
+	if role != db.RoleAdmin || middleware.IsScopedAPIKey(c) {
 		respondError(c, http.StatusForbidden, "admin role required")
 		return false
 	}
 	return true
+}
+
+// requireGlobalAdmin is the fail-closed gate for server-wide operations. A
+// tenant admin may administer only that tenant; tenant 0 is the legacy global
+// operator. Scoped API keys are always denied.
+func (s *Server) requireGlobalAdmin(c *gin.Context) bool {
+	role, _ := c.Get("user_role")
+	tid, ok := s.resolveTenant(c)
+	if role != db.RoleAdmin || !ok || tid != 0 || middleware.IsScopedAPIKey(c) {
+		respondError(c, http.StatusForbidden, "global admin required")
+		return false
+	}
+	return true
+}
+
+func (s *Server) globalAdminOnly() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !s.requireGlobalAdmin(c) {
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
 }
 
 // requireOperator checks that the current user holds a role that exists and is

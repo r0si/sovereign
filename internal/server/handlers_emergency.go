@@ -127,7 +127,7 @@ func (s *Server) reloadKillSwitchState() {
 }
 
 // setKillSwitch persists the kill-switch state and refreshes the cache.
-func (s *Server) setKillSwitch(armed bool, token, operator string) {
+func (s *Server) setKillSwitch(armed bool, token, operator string) error {
 	now := time.Now()
 	var ks db.KillSwitch
 	err := s.db.First(&ks, 1).Error
@@ -148,8 +148,10 @@ func (s *Server) setKillSwitch(armed bool, token, operator string) {
 	}
 	if err := s.db.Save(&ks).Error; err != nil {
 		slog.Error("Kill switch: failed to persist state", "armed", armed, "err", err)
+		return err
 	}
 	s.reloadKillSwitchState()
+	return nil
 }
 
 // handleKillSwitch arms or disarms the fleet kill-switch. Arming requires an
@@ -194,7 +196,10 @@ func (s *Server) handleKillSwitch(c *gin.Context) {
 			return
 		}
 		token := hex.EncodeToString(tokenBytes)
-		s.setKillSwitch(true, token, user.Username)
+		if err := s.setKillSwitch(true, token, user.Username); err != nil {
+			respondError(c, http.StatusInternalServerError, "failed to arm kill switch")
+			return
+		}
 
 		// Dispatch self-destruct (uninstall) tasks to the whole fleet so
 		// online implants react immediately; the beacon-level token covers
@@ -219,7 +224,10 @@ func (s *Server) handleKillSwitch(c *gin.Context) {
 			"tasks_dispatched": dispatched,
 		})
 	case "disarm":
-		s.setKillSwitch(false, "", user.Username)
+		if err := s.setKillSwitch(false, "", user.Username); err != nil {
+			respondError(c, http.StatusInternalServerError, "failed to disarm kill switch")
+			return
+		}
 
 		// Reclaim uninstall tasks that were dispatched at arm time but never
 		// executed. An "armed then disarmed" kill switch is a false alarm in

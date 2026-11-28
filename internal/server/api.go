@@ -510,9 +510,7 @@ func (s *Server) apiDashboardStats(c *gin.Context) {
 // ── REST API: Audit Logs ──
 
 func (s *Server) apiListAuditLogs(c *gin.Context) {
-	role, _ := c.Get("user_role")
-	if role != "admin" {
-		respondError(c, http.StatusForbidden, "admin required")
+	if !s.requireAdmin(c) {
 		return
 	}
 	var logs []db.AuditLog

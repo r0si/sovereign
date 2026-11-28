@@ -20,7 +20,7 @@ func (s *Server) registerMiscRoutes(auth *gin.RouterGroup) {
 		middleware.RequirePermission(db.PermSettingsWrite), s.handleRefreshUpdateCheck)
 	auth.GET("/api/update-progress", s.handleUpdateProgress)
 
-	auth.POST("/api/update-check/hot-update", middleware.RequireRole(db.RoleAdmin), s.handleHotUpdate)
+	auth.POST("/api/update-check/hot-update", middleware.RequireRole(db.RoleAdmin), s.globalAdminOnly(), s.handleHotUpdate)
 
 	miscWrite := auth.Group("/")
 	miscWrite.Use(middleware.RequirePermission(db.PermAgentsWrite))

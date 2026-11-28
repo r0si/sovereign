@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/r0si/sovereign/internal/db"
+	"github.com/r0si/sovereign/internal/server/middleware"
 	"github.com/r0si/sovereign/internal/util"
 )
 
@@ -68,7 +69,7 @@ const agentLockTTL = 15 * time.Minute
 // force-flag checks that produce their own status codes).
 func (s *Server) isAdmin(c *gin.Context) bool {
 	role, _ := c.Get("user_role")
-	return role == "admin"
+	return role == db.RoleAdmin && !middleware.IsScopedAPIKey(c)
 }
 
 // lockHolderOf returns the live holder of an agent lock ("", false when

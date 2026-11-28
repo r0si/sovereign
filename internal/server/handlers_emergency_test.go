@@ -55,7 +55,9 @@ func seedKillSwitchOperator(t *testing.T, s *Server) db.User {
 
 func TestEnforceKillSwitchUnarmed(t *testing.T) {
 	s := initKillSwitchServer(t)
-	s.setKillSwitch(false, "", "tester")
+	if err := s.setKillSwitch(false, "", "tester"); err != nil {
+		t.Fatalf("disarm kill switch: %v", err)
+	}
 
 	resp := beaconResponse{}
 	s.enforceKillSwitch(db.Implant{ID: "test-agent-1"}, &resp)
@@ -69,7 +71,9 @@ func TestEnforceKillSwitchArmedAuthenticated(t *testing.T) {
 	implant := db.Implant{ID: "test-agent-1"}
 
 	const token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	s.setKillSwitch(true, token, "tester")
+	if err := s.setKillSwitch(true, token, "tester"); err != nil {
+		t.Fatalf("arm kill switch: %v", err)
+	}
 
 	resp := beaconResponse{}
 	s.enforceKillSwitch(implant, &resp)
@@ -93,7 +97,9 @@ func TestEnforceKillSwitchArmedAuthenticated(t *testing.T) {
 	}
 
 	// After disarm the same response must carry nothing again.
-	s.setKillSwitch(false, "", "tester")
+	if err := s.setKillSwitch(false, "", "tester"); err != nil {
+		t.Fatalf("disarm kill switch: %v", err)
+	}
 	resp2 := beaconResponse{}
 	s.enforceKillSwitch(implant, &resp2)
 	if resp2.KillSwitch != "" || resp2.KillSwitchMAC != "" {
@@ -215,5 +221,25 @@ func postKillSwitch(t *testing.T, s *Server, userID uint, action, password strin
 	s.handleKillSwitch(c)
 	if w.Code != wantCode {
 		t.Fatalf("killswitch %s: expected %d got %d; body=%s", action, wantCode, w.Code, w.Body.String())
+	}
+}
+
+func TestSetKillSwitchReturnsPersistenceFailure(t *testing.T) {
+	s := initKillSwitchServer(t)
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		t.Fatalf("get sql db: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close sql db: %v", err)
+	}
+	if err := s.setKillSwitch(true, "token", "tester"); err == nil {
+		t.Fatal("setKillSwitch succeeded after the database was closed")
+	}
+	s.killSwitchMu.RLock()
+	armed := s.killSwitchArmed
+	s.killSwitchMu.RUnlock()
+	if armed {
+		t.Fatal("failed persistence changed the in-memory kill-switch state")
 	}
 }

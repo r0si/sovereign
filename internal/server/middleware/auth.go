@@ -630,6 +630,16 @@ func apiKeyScopes(c *gin.Context) (map[string]bool, bool) {
 	return nil, true
 }
 
+// IsScopedAPIKey reports whether the request is authenticated by a scoped API
+// key. Legacy full-access keys and session cookies return false.
+func IsScopedAPIKey(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	set, isKey := apiKeyScopes(c)
+	return isKey && set != nil
+}
+
 // Custom roles are resolved on every authenticated request so permission edits
 // take effect immediately. A missing role, DB error, or malformed permission
 // list grants nothing; built-in roles continue to use the static permission map.

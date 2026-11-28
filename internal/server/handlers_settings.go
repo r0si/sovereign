@@ -743,9 +743,7 @@ func (s *Server) databaseSizeBytes() int64 {
 }
 
 func (s *Server) handleDownloadConfig(c *gin.Context) {
-	role, _ := c.Get("user_role")
-	if role != "admin" {
-		respondError(c, http.StatusForbidden, "insufficient permissions")
+	if !s.requireAdmin(c) {
 		return
 	}
 	data, err := os.ReadFile(s.configPath)

@@ -29,7 +29,7 @@ func (s *Server) registerSettingsRoutes(auth *gin.RouterGroup) {
 		// Destructive / team-wide actions are admin-only.
 		settingsWrite.POST("/settings/purge/tasks", middleware.RequireRole(db.RoleAdmin), s.handlePurgeTasks)
 		settingsWrite.POST("/settings/purge/audit", middleware.RequireRole(db.RoleAdmin), s.handlePurgeAuditLogs)
-		settingsWrite.POST("/settings/jwt/regenerate", middleware.RequireRole(db.RoleAdmin), s.handleRegenerateJWT)
+		settingsWrite.POST("/settings/jwt/regenerate", middleware.RequireRole(db.RoleAdmin), s.globalAdminOnly(), s.handleRegenerateJWT)
 		// The /update-signing/* routes were removed. Update signing is done
 		// offline against crypto.update_signing_key; the key is still pinned
 		// into implants and enforced at hot-update time.
@@ -37,9 +37,9 @@ func (s *Server) registerSettingsRoutes(auth *gin.RouterGroup) {
 		settingsWrite.POST("/settings/db/backup", s.handleDBBackup)
 		// The raw database contains every secret (users, API-key hashes,
 		// encrypted creds) and restore swaps the live DB — admin only.
-		settingsWrite.GET("/settings/db/backups", middleware.RequireRole(db.RoleAdmin), s.handleDBBackupList)
-		settingsWrite.GET("/settings/db/backups/download", middleware.RequireRole(db.RoleAdmin), s.handleDBBackupDownload)
-		settingsWrite.POST("/settings/db/restore", middleware.RequireRole(db.RoleAdmin), s.handleDBRestore)
+		settingsWrite.GET("/settings/db/backups", middleware.RequireRole(db.RoleAdmin), s.globalAdminOnly(), s.handleDBBackupList)
+		settingsWrite.GET("/settings/db/backups/download", middleware.RequireRole(db.RoleAdmin), s.globalAdminOnly(), s.handleDBBackupDownload)
+		settingsWrite.POST("/settings/db/restore", middleware.RequireRole(db.RoleAdmin), s.globalAdminOnly(), s.handleDBRestore)
 		settingsWrite.GET("/settings/config/download", s.handleDownloadConfig)
 		settingsWrite.POST("/settings/webhooks", s.handleSaveSettingsWebhooks)
 		settingsWrite.POST("/settings/webhooks/test", s.handleTestSettingsWebhook)
@@ -51,8 +51,8 @@ func (s *Server) registerSettingsRoutes(auth *gin.RouterGroup) {
 		settingsWrite.GET("/admin/emergency-status", s.handleEmergencyStatus)
 
 		// Fleet kill-switch broadcast (arm/disarm) — admin only.
-		settingsWrite.POST("/admin/killswitch", middleware.RequireRole(db.RoleAdmin), s.handleKillSwitch)
-		settingsWrite.GET("/admin/killswitch/status", middleware.RequireRole(db.RoleAdmin), s.handleKillSwitchStatus)
+		settingsWrite.POST("/admin/killswitch", middleware.RequireRole(db.RoleAdmin), s.globalAdminOnly(), s.handleKillSwitch)
+		settingsWrite.GET("/admin/killswitch/status", middleware.RequireRole(db.RoleAdmin), s.globalAdminOnly(), s.handleKillSwitchStatus)
 
 		settingsWrite.GET("/settings/certs", s.handleGetCertInfo)
 		settingsWrite.POST("/settings/certs/regenerate", s.handleRegenerateCert)
