@@ -44,7 +44,7 @@ func (s *Server) registerSettingsRoutes(auth *gin.RouterGroup) {
 		settingsWrite.POST("/settings/webhooks", s.handleSaveSettingsWebhooks)
 		settingsWrite.POST("/settings/webhooks/test", s.handleTestSettingsWebhook)
 
-		settingsWrite.POST("/settings/maintenance/purge", s.handleSettingsMaintenancePurge)
+		settingsWrite.POST("/settings/maintenance/purge", middleware.RequireRole(db.RoleAdmin), s.globalAdminOnly(), s.handleSettingsMaintenancePurge)
 
 		// Mass agent self-destruct — admin only.
 		settingsWrite.POST("/admin/emergency-stop", middleware.RequireRole(db.RoleAdmin), s.handleEmergencyStop)

@@ -52,7 +52,7 @@ func TestPurgeTasksOnlyRemovesTerminalOldTasks(t *testing.T) {
 	}
 	for _, tc := range cases {
 		if err := s.db.Create(&db.Task{
-			AgentID: "purge-agent", Type: "ps", Command: "x", Status: tc.status,
+			AgentID: "purge-agent", Type: "ps", Command: "x", Status: tc.status, TenantID: 1,
 			CreatedAt: tc.age, UpdatedAt: tc.age,
 		}).Error; err != nil {
 			t.Fatalf("seed %s: %v", tc.name, err)
@@ -97,7 +97,7 @@ func TestPurgeTasksClampsWindow(t *testing.T) {
 	}
 	for i, r := range rows {
 		if err := s.db.Create(&db.Task{
-			AgentID: fmt.Sprintf("clamp-%d", i), Type: "ps", Status: r.status,
+			AgentID: fmt.Sprintf("clamp-%d", i), Type: "ps", Status: r.status, TenantID: 1,
 			CreatedAt: r.age, UpdatedAt: r.age,
 		}).Error; err != nil {
 			t.Fatalf("seed %d: %v", i, err)
@@ -137,7 +137,7 @@ func TestPurgeTasksClampsWindow(t *testing.T) {
 }
 
 // TestPurgeAuditLogsIsTenantScoped proves the audit purge only removes the
-// caller's own entries plus legacy (tenant 0) ones, and reports the real count.
+// caller's own entries and reports the real count. Legacy rows remain global.
 func TestPurgeAuditLogsIsTenantScoped(t *testing.T) {
 	s := mustTenantServer(t)
 	old := time.Now().AddDate(0, 0, -1000)
@@ -161,19 +161,19 @@ func TestPurgeAuditLogsIsTenantScoped(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 	}
-	// Own tenant (1) + legacy (0) are in scope; tenant 2 is not.
-	if !strings.Contains(w.Body.String(), "Purged 2 old audit logs") {
-		t.Fatalf("body = %s, want only the caller's own and legacy entries", w.Body.String())
+	// Only the caller's tenant is in scope; tenant 0 and tenant 2 remain.
+	if !strings.Contains(w.Body.String(), "Purged 1 old audit logs") {
+		t.Fatalf("body = %s, want only the caller's own entry", w.Body.String())
 	}
 
 	var count int64
 	if err := s.db.Model(&db.AuditLog{}).Count(&count).Error; err != nil {
 		t.Fatalf("count: %v", err)
 	}
-	// Three rows: the foreign one, the fresh one, and the purge marker the
-	// handler now writes so destroying audit history leaves a record of itself.
-	if count != 3 {
-		t.Fatalf("%d audit rows remain, want the foreign row, the fresh one and the purge marker", count)
+	// Four rows: the foreign row, the legacy row, the fresh one, and the purge
+	// marker the handler writes so destroying audit history leaves a record.
+	if count != 4 {
+		t.Fatalf("%d audit rows remain, want foreign, legacy, fresh and purge marker", count)
 	}
 	var markers int64
 	if err := s.db.Model(&db.AuditLog{}).Where("action = ?", "audit_purge").Count(&markers).Error; err != nil {

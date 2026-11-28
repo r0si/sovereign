@@ -594,7 +594,7 @@ func (s *Server) handlePurgeTasks(c *gin.Context) {
 		days = 365
 	}
 	cutoff := time.Now().AddDate(0, 0, -days)
-	result := s.db.Where("created_at < ?", cutoff).
+	result := s.tenantScope(s.db, c).Where("created_at < ?", cutoff).
 		Where("status IN ?", []string{"completed", "failed"}).
 		Delete(&db.Task{})
 	if result.Error != nil {
@@ -621,7 +621,7 @@ func (s *Server) handlePurgeAuditLogs(c *gin.Context) {
 		days = 730
 	}
 	cutoff := time.Now().AddDate(0, 0, -days)
-	scope := s.auditTenantScope(s.db.Model(&db.AuditLog{}), c)
+	scope := s.tenantScope(s.db.Model(&db.AuditLog{}), c)
 
 	// Count first so the purge can describe itself: destroying audit history is
 	// exactly the operation that must leave a record of its own.
@@ -637,7 +637,7 @@ func (s *Server) handlePurgeAuditLogs(c *gin.Context) {
 			fmt.Sprintf("purged %d audit rows older than %d days", toPurge, days), true, nil)
 	}
 
-	result := s.auditTenantScope(s.db.Model(&db.AuditLog{}), c).
+	result := s.tenantScope(s.db.Model(&db.AuditLog{}), c).
 		Where("created_at < ?", cutoff).Delete(&db.AuditLog{})
 	if result.Error != nil {
 		respondError(c, http.StatusInternalServerError, "Failed to purge audit logs")

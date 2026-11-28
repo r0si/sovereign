@@ -16,6 +16,7 @@ import (
 	"github.com/r0si/sovereign/internal/db"
 	"github.com/r0si/sovereign/internal/payload"
 	"github.com/r0si/sovereign/pkg/protocol"
+	"gorm.io/gorm"
 )
 
 func (s *Server) handleAPIPackerTemplates(c *gin.Context) {
@@ -432,6 +433,9 @@ func (s *Server) handlePackerArtifact(c *gin.Context) {
 // ── Settings Maintenance Purge ────────────────────────────────────────
 
 func (s *Server) handleSettingsMaintenancePurge(c *gin.Context) {
+	if !s.requireGlobalAdmin(c) {
+		return
+	}
 	retentionDays := s.cleanupRetentionDays()
 	cutoff := time.Now().AddDate(0, 0, -retentionDays)
 
@@ -453,15 +457,30 @@ func (s *Server) handleSettingsMaintenancePurge(c *gin.Context) {
 		// solely by server.audit_retention_days (floor 90d) in the automatic
 		// cleanup; a one-click UI purge must never erase the tamper chain.
 	}
-	for _, t := range tables {
-		var count int64
-		if err := s.db.Table(t.name).Where(t.col+" < ?", cutoff).Count(&count).Error; err != nil {
-			slog.Error("Failed to count purgeable records", "table", t.name, "err", err)
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		for _, table := range tables {
+			var count int64
+			if err := tx.Table(table.name).Where(table.col+" < ?", cutoff).Count(&count).Error; err != nil {
+				return fmt.Errorf("count %s: %w", table.name, err)
+			}
+			if count == 0 {
+				continue
+			}
+			result := tx.Table(table.name).Where(table.col+" < ?", cutoff).Delete(nil)
+			if result.Error != nil {
+				return fmt.Errorf("delete %s: %w", table.name, result.Error)
+			}
+			if result.RowsAffected != count {
+				return fmt.Errorf("delete %s: removed %d of %d rows", table.name, result.RowsAffected, count)
+			}
+			results = append(results, purgeResult{Table: table.name, Count: count})
 		}
-		if count > 0 {
-			s.db.Table(t.name).Where(t.col+" < ?", cutoff).Delete(nil)
-			results = append(results, purgeResult{Table: t.name, Count: count})
-		}
+		return nil
+	})
+	if err != nil {
+		slog.Error("Failed to purge maintenance data", "error", err)
+		respondError(c, http.StatusInternalServerError, "failed to purge maintenance data")
+		return
 	}
 
 	s.LogAuditRecord(c, "maintenance_purge", "system", "", fmt.Sprintf("Purged data older than %d days (forensic tables excluded)", retentionDays), true, nil)
